@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1994, 2009, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2013, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -16,9 +16,24 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 *****************************************************************************/
 
-/********************************************************************//**
-@file include/mem0pool.ic
-The lowest-level memory management
+/**************************************************//**
+@file include/dyn0types.h
+The dynamically allocated buffer types and constants
 
-Created 6/8/1994 Heikki Tuuri
-*************************************************************************/
+Created 2013-03-16 Sunny Bains
+*******************************************************/
+
+#ifndef dyn0types_h
+#define dyn0types_h
+
+/** Value of dyn_block_t::magic_n */
+#define DYN_BLOCK_MAGIC_N	375767
+
+/** This is the initial 'payload' size of a dynamic array;
+this must be > MLOG_BUF_MARGIN + 30! */
+#define	DYN_ARRAY_DATA_SIZE	512
+
+/** Flag for dyn_block_t::used that indicates a full block */
+#define DYN_BLOCK_FULL_FLAG	0x1000000UL
+
+#endif /* dyn0types_h */
