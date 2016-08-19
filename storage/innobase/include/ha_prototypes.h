@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 2006, 2015, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2006, 2016, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -301,6 +301,14 @@ thd_set_lock_wait_time(
 	THD*	thd,	/*!< in/out: thread handle */
 	ulint	value);	/*!< in: time waited for the lock */
 
+/** Get status of innodb_tmpdir.
+@param[in]	thd	thread handle, or NULL to query
+			the global innodb_tmpdir.
+@retval NULL if innodb_tmpdir="" */
+const char*
+thd_innodb_tmpdir(
+	THD*	thd);
+
 /**********************************************************************//**
 Get the current setting of the table_cache_size global parameter. We do
 a dirty read because for one there is no synchronization object and
@@ -408,7 +416,7 @@ ib_errf(
 	ib_uint32_t	code,		/*!< MySQL error code */
 	const char*	format,		/*!< printf format */
 	...)				/*!< Args */
-	__attribute__((format(printf, 4, 5)));
+	MY_ATTRIBUTE((format(printf, 4, 5)));
 
 /******************************************************************//**
 Use this when the args are passed to the format string from
@@ -479,7 +487,7 @@ innobase_next_autoinc(
 	ulonglong	step,		/*!< in: AUTOINC increment step */
 	ulonglong	offset,		/*!< in: AUTOINC offset */
 	ulonglong	max_value)	/*!< in: max value for type */
-	__attribute__((pure, warn_unused_result));
+	MY_ATTRIBUTE((pure, warn_unused_result));
 
 /**********************************************************************
 Check if the length of the identifier exceeds the maximum allowed.
@@ -520,7 +528,7 @@ ICP_RESULT
 innobase_index_cond(
 /*================*/
 	void*	file)	/*!< in/out: pointer to ha_innobase */
-	__attribute__((warn_unused_result));
+	MY_ATTRIBUTE((warn_unused_result));
 
 /******************************************************************//**
 Gets information on the durability property requested by thread.
@@ -534,7 +542,7 @@ enum durability_properties
 thd_requested_durability(
 /*=====================*/
 	const THD* thd)	/*!< in: thread handle */
-	__attribute__((warn_unused_result));
+	MY_ATTRIBUTE((warn_unused_result));
 
 /** Update the system variable with the given value of the InnoDB
 buffer pool size.

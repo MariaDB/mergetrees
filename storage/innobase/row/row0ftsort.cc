@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 2010, 2015, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2010, 2016, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -224,6 +224,8 @@ row_fts_psort_info_init(
 	common_info->merge_event = os_event_create(0);
 	common_info->opt_doc_id_size = opt_doc_id_size;
 
+	ut_ad(trx->mysql_thd != NULL);
+	const char*	path = thd_innodb_tmpdir(trx->mysql_thd);
 	/* There will be FTS_NUM_AUX_INDEX number of "sort buckets" for
 	each parallel sort thread. Each "sort bucket" holds records for
 	a particular "FTS index partition" */
@@ -246,8 +248,8 @@ row_fts_psort_info_init(
 			psort_info[j].merge_buf[i] = row_merge_buf_create(
 				dup->index);
 
-			if (row_merge_file_create(psort_info[j].merge_file[i])
-			    < 0) {
+			if (row_merge_file_create(psort_info[j].merge_file[i],
+						  path) < 0) {
 				goto func_exit;
 			}
 
@@ -633,8 +635,18 @@ row_merge_fts_doc_tokenize(
 		dfield_dup(field, buf->heap);
 
 		/* One variable length column, word with its lenght less than
-		fts_max_token_size, add one extra size and one extra byte */
-		cur_len += 2;
+		fts_max_token_size, add one extra size and one extra byte.
+
+		Since the max length for FTS token now is larger than 255,
+		so we will need to signify length byte itself, so only 1 to 128
+		bytes can be used for 1 bytes, larger than that 2 bytes. */
+		if (t_str.f_len < 128) {
+			/* Extra size is one byte. */
+			cur_len += 2;
+		} else {
+			/* Extra size is two bytes. */
+			cur_len += 3;
+		}
 
 		/* Reserve one byte for the end marker of row_merge_block_t. */
 		if (buf->total_size + data_size[idx] + cur_len
@@ -734,6 +746,11 @@ fts_parallel_tokenization(
 	fts_tokenize_ctx_t	t_ctx;
 	ulint			retried = 0;
 	dberr_t			error = DB_SUCCESS;
+
+	ut_ad(psort_info->psort_common->trx->mysql_thd != NULL);
+
+	const char*		path = thd_innodb_tmpdir(
+		psort_info->psort_common->trx->mysql_thd);
 
 	ut_ad(psort_info);
 
@@ -962,7 +979,7 @@ exit:
 			continue;
 		}
 
-		tmpfd[i] = row_merge_file_create_low();
+		tmpfd[i] = row_merge_file_create_low(path);
 		if (tmpfd[i] < 0) {
 			error = DB_OUT_OF_MEMORY;
 			goto func_exit;
@@ -1006,7 +1023,7 @@ func_exit:
 	os_event_set(psort_info->psort_common->sort_event);
 	psort_info->child_status = FTS_CHILD_EXITING;
 
-	os_thread_exit(NULL);
+	os_thread_exit();
 
 	OS_THREAD_DUMMY_RETURN;
 }
@@ -1052,7 +1069,7 @@ fts_parallel_merge(
 	os_event_set(psort_info->psort_common->merge_event);
 	psort_info->child_status = FTS_CHILD_EXITING;
 
-	os_thread_exit(NULL);
+	os_thread_exit();
 
 	OS_THREAD_DUMMY_RETURN;
 }
@@ -1132,7 +1149,7 @@ row_merge_write_fts_node(
 /********************************************************************//**
 Insert processed FTS data to auxillary index tables.
 @return DB_SUCCESS if insertion runs fine */
-static __attribute__((nonnull))
+static MY_ATTRIBUTE((nonnull))
 dberr_t
 row_merge_write_fts_word(
 /*=====================*/

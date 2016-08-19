@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 2011, 2015, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2011, 2016, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -201,20 +201,22 @@ struct row_log_t {
 				old table */
 	ulint		n_old_vcol;
 				/*!< number of virtual column in old table */
+	const char*	path;	/*!< where to create temporary file during
+				log operation */
 };
 
 
 /** Create the file or online log if it does not exist.
 @param[in,out] log     online rebuild log
 @return true if success, false if not */
-static __attribute__((warn_unused_result))
+static MY_ATTRIBUTE((warn_unused_result))
 int
 row_log_tmpfile(
 	row_log_t*	log)
 {
 	DBUG_ENTER("row_log_tmpfile");
 	if (log->fd < 0) {
-		log->fd = row_merge_file_create_low();
+		log->fd = row_merge_file_create_low(log->path);
 		DBUG_EXECUTE_IF("row_log_tmpfile_fail",
 				if (log->fd > 0)
 					row_merge_file_destroy_low(log->fd);
@@ -230,7 +232,7 @@ row_log_tmpfile(
 /** Allocate the memory for the log buffer.
 @param[in,out]	log_buf	Buffer used for log operation
 @return TRUE if success, false if not */
-static __attribute__((warn_unused_result))
+static MY_ATTRIBUTE((warn_unused_result))
 bool
 row_log_block_allocate(
 	row_log_buf_t&	log_buf)
@@ -422,7 +424,7 @@ row_log_table_get_error(
 /******************************************************//**
 Starts logging an operation to a table that is being rebuilt.
 @return pointer to log, or NULL if no logging is necessary */
-static __attribute__((nonnull, warn_unused_result))
+static MY_ATTRIBUTE((nonnull, warn_unused_result))
 byte*
 row_log_table_open(
 /*===============*/
@@ -457,7 +459,7 @@ err_exit:
 
 /******************************************************//**
 Stops logging an operation to a table that is being rebuilt. */
-static __attribute__((nonnull))
+static MY_ATTRIBUTE((nonnull))
 void
 row_log_table_close_func(
 /*=====================*/
@@ -527,6 +529,20 @@ err_exit:
 # define row_log_table_close(log, b, size, avail)	\
 	row_log_table_close_func(log, size, avail)
 #endif /* UNIV_DEBUG */
+
+/** Check whether a virtual column is indexed in the new table being
+created during alter table
+@param[in]	index	cluster index
+@param[in]	v_no	virtual column number
+@return true if it is indexed, else false */
+bool
+row_log_col_is_indexed(
+	const dict_index_t*	index,
+	ulint			v_no)
+{
+	return(dict_table_get_nth_v_col(
+		index->online_log->table, v_no)->m_col.ord_part);
+}
 
 /******************************************************//**
 Logs a delete operation to a table that is being rebuilt.
@@ -658,7 +674,7 @@ row_log_table_delete(
 	if (ventry->n_v_fields > 0) {
 		ulint	v_extra;
 		mrec_size += rec_get_converted_size_temp(
-                        index, NULL, 0, ventry, &v_extra);
+                        new_index, NULL, 0, ventry, &v_extra);
         }
 
 	if (byte* b = row_log_table_open(index->online_log,
@@ -951,11 +967,11 @@ row_log_table_low(
 	if (ventry && ventry->n_v_fields > 0) {
 		ulint	v_extra = 0;
 		mrec_size += rec_get_converted_size_temp(
-			index, NULL, 0, ventry, &v_extra);
+			new_index, NULL, 0, ventry, &v_extra);
 
 		if (o_ventry) {
 			mrec_size += rec_get_converted_size_temp(
-				index, NULL, 0, o_ventry, &v_extra);
+				new_index, NULL, 0, o_ventry, &v_extra);
 		}
 	} else if (index->table->n_v_cols) {
 		/* Always leave 2 bytes length marker for virtual column
@@ -1429,7 +1445,7 @@ row_log_table_blob_alloc(
 /******************************************************//**
 Converts a log record to a table row.
 @return converted row, or NULL if the conversion fails */
-static __attribute__((nonnull, warn_unused_result))
+static MY_ATTRIBUTE((nonnull, warn_unused_result))
 const dtuple_t*
 row_log_table_apply_convert_mrec(
 /*=============================*/
@@ -1595,7 +1611,7 @@ blob_done:
 /******************************************************//**
 Replays an insert operation on a table that was rebuilt.
 @return DB_SUCCESS or error code */
-static __attribute__((nonnull, warn_unused_result))
+static MY_ATTRIBUTE((nonnull, warn_unused_result))
 dberr_t
 row_log_table_apply_insert_low(
 /*===========================*/
@@ -1673,7 +1689,7 @@ row_log_table_apply_insert_low(
 /******************************************************//**
 Replays an insert operation on a table that was rebuilt.
 @return DB_SUCCESS or error code */
-static __attribute__((nonnull, warn_unused_result))
+static MY_ATTRIBUTE((nonnull, warn_unused_result))
 dberr_t
 row_log_table_apply_insert(
 /*=======================*/
@@ -1725,7 +1741,7 @@ row_log_table_apply_insert(
 /******************************************************//**
 Deletes a record from a table that is being rebuilt.
 @return DB_SUCCESS or error code */
-static __attribute__((warn_unused_result))
+static MY_ATTRIBUTE((warn_unused_result))
 dberr_t
 row_log_table_apply_delete_low(
 /*===========================*/
@@ -1829,7 +1845,7 @@ flag_ok:
 /******************************************************//**
 Replays a delete operation on a table that was rebuilt.
 @return DB_SUCCESS or error code */
-static __attribute__((nonnull(1, 3, 4, 5, 6, 7), warn_unused_result))
+static MY_ATTRIBUTE((nonnull(1, 3, 4, 5, 6, 7), warn_unused_result))
 dberr_t
 row_log_table_apply_delete(
 /*=======================*/
@@ -1967,7 +1983,7 @@ all_done:
 /******************************************************//**
 Replays an update operation on a table that was rebuilt.
 @return DB_SUCCESS or error code */
-static __attribute__((nonnull, warn_unused_result))
+static MY_ATTRIBUTE((nonnull, warn_unused_result))
 dberr_t
 row_log_table_apply_update(
 /*=======================*/
@@ -2180,7 +2196,7 @@ func_exit_committed:
 		row, NULL, index, heap);
 	upd_t*		update	= row_upd_build_difference_binary(
 		index, entry, btr_pcur_get_rec(&pcur), cur_offsets,
-		false, NULL, heap);
+		false, NULL, heap, dup->table);
 
 	if (!update->n_fields) {
 		/* Nothing to do. */
@@ -2332,7 +2348,7 @@ func_exit_committed:
 Applies an operation to a table that was rebuilt.
 @return NULL on failure (mrec corruption) or when out of data;
 pointer to next record on success */
-static __attribute__((nonnull, warn_unused_result))
+static MY_ATTRIBUTE((nonnull, warn_unused_result))
 const mrec_t*
 row_log_table_apply_op(
 /*===================*/
@@ -2727,7 +2743,7 @@ row_log_progress_inc_per_block()
 ALTER TABLE. If not NULL, then stage->inc() will be called for each block
 of log that is applied.
 @return DB_SUCCESS, or error code on failure */
-static __attribute__((warn_unused_result))
+static MY_ATTRIBUTE((warn_unused_result))
 dberr_t
 row_log_table_apply_ops(
 	que_thr_t*		thr,
@@ -3135,8 +3151,9 @@ row_log_allocate(
 	const dtuple_t*	add_cols,
 				/*!< in: default values of
 				added columns, or NULL */
-	const ulint*	col_map)/*!< in: mapping of old column
+	const ulint*	col_map,/*!< in: mapping of old column
 				numbers to new ones, or NULL if !table */
+	const char*	path)	/*!< in: where to create temporary file */
 {
 	row_log_t*	log;
 	DBUG_ENTER("row_log_allocate");
@@ -3170,6 +3187,7 @@ row_log_allocate(
 	log->tail.block = log->head.block = NULL;
 	log->head.blocks = log->head.bytes = 0;
 	log->head.total = 0;
+	log->path = path;
 	log->n_old_col = index->table->n_cols;
 	log->n_old_vcol = index->table->n_v_cols;
 
@@ -3222,7 +3240,7 @@ row_log_get_max_trx(
 
 /******************************************************//**
 Applies an operation to a secondary index that was being created. */
-static __attribute__((nonnull))
+static MY_ATTRIBUTE((nonnull))
 void
 row_log_apply_op_low(
 /*=================*/
@@ -3459,7 +3477,7 @@ func_exit:
 Applies an operation to a secondary index that was being created.
 @return NULL on failure (mrec corruption) or when out of data;
 pointer to next record on success */
-static __attribute__((nonnull, warn_unused_result))
+static MY_ATTRIBUTE((nonnull, warn_unused_result))
 const mrec_t*
 row_log_apply_op(
 /*=============*/

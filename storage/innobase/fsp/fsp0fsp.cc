@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2015, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1995, 2016, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -51,6 +51,8 @@ Created 11/29/1995 Heikki Tuuri
 #include "dict0mem.h"
 #include "fsp0types.h"
 
+#include <my_aes.h>
+
 /** Returns an extent to the free list of a space.
 @param[in]	page_id		page id in the extent
 @param[in]	page_size	page size
@@ -65,7 +67,7 @@ fsp_free_extent(
 /********************************************************************//**
 Marks a page used. The page must reside within the extents of the given
 segment. */
-static __attribute__((nonnull))
+static MY_ATTRIBUTE((nonnull))
 void
 fseg_mark_page_used(
 /*================*/
@@ -143,7 +145,7 @@ fseg_alloc_free_page_low(
 	, ibool			has_done_reservation
 #endif /* UNIV_DEBUG */
 )
-	__attribute__((warn_unused_result));
+	MY_ATTRIBUTE((warn_unused_result));
 
 /** Gets a pointer to the space header and x-locks its page.
 @param[in]	id		space id
@@ -226,6 +228,8 @@ fsp_flags_is_valid(
 	bool	has_data_dir = FSP_FLAGS_HAS_DATA_DIR(flags);
 	bool	is_shared = FSP_FLAGS_GET_SHARED(flags);
 	bool	is_temp = FSP_FLAGS_GET_TEMPORARY(flags);
+	bool	is_encryption = FSP_FLAGS_GET_ENCRYPTION(flags);
+
 	ulint	unused = FSP_FLAGS_GET_UNUSED(flags);
 
 	DBUG_EXECUTE_IF("fsp_flags_is_valid_failure", return(false););
@@ -271,10 +275,16 @@ fsp_flags_is_valid(
 		return(false);
 	}
 
+	/* Only single-table and not temp tablespaces use the encryption
+	clause. */
+	if (is_encryption && (is_shared || is_temp)) {
+		return(false);
+	}
+
 #if UNIV_FORMAT_MAX != UNIV_FORMAT_B
 # error UNIV_FORMAT_MAX != UNIV_FORMAT_B, Add more validations.
 #endif
-#if FSP_FLAGS_POS_UNUSED != 13
+#if FSP_FLAGS_POS_UNUSED != 14
 # error You have added a new FSP_FLAG without adding a validation check.
 #endif
 
@@ -551,7 +561,7 @@ xdes_init(
 the same as the tablespace header
 @return pointer to the extent descriptor, NULL if the page does not
 exist in the space or if the offset exceeds free limit */
-UNIV_INLINE __attribute__((warn_unused_result))
+UNIV_INLINE MY_ATTRIBUTE((warn_unused_result))
 xdes_t*
 xdes_get_descriptor_with_space_hdr(
 	fsp_header_t*	sp_header,
@@ -793,7 +803,7 @@ byte*
 fsp_parse_init_file_page(
 /*=====================*/
 	byte*		ptr,	/*!< in: buffer */
-	byte*		end_ptr __attribute__((unused)), /*!< in: buffer end */
+	byte*		end_ptr MY_ATTRIBUTE((unused)), /*!< in: buffer end */
 	buf_block_t*	block)	/*!< in: block or NULL */
 {
 	ut_ad(ptr != NULL);
@@ -846,6 +856,196 @@ fsp_header_init_fields(
 }
 
 #ifndef UNIV_HOTBACKUP
+/** Get the offset of encrytion information in page 0.
+@param[in]	page_size	page size.
+@return	offset on success, otherwise 0. */
+static
+ulint
+fsp_header_get_encryption_offset(
+	const page_size_t&	page_size)
+{
+	ulint	offset;
+#ifdef UNIV_DEBUG
+	ulint	left_size;
+#endif
+
+	offset = XDES_ARR_OFFSET + XDES_SIZE * xdes_arr_size(page_size);
+#ifdef UNIV_DEBUG
+	left_size = page_size.physical() - FSP_HEADER_OFFSET - offset
+		- FIL_PAGE_DATA_END;
+
+	ut_ad(left_size >= ENCRYPTION_INFO_SIZE_V2);
+#endif
+
+	return offset;
+}
+
+/** Fill the encryption info.
+@param[in]	space		tablespace
+@param[in,out]	encrypt_info	buffer for encrypt key.
+@return true if success. */
+bool
+fsp_header_fill_encryption_info(
+	fil_space_t*		space,
+	byte*			encrypt_info)
+{
+	byte*			ptr;
+	lint			elen;
+	ulint			master_key_id;
+	byte*			master_key;
+	byte			key_info[ENCRYPTION_KEY_LEN * 2];
+	ulint			crc;
+	Encryption::Version	version;
+#ifdef	UNIV_ENCRYPT_DEBUG
+	const byte*		data;
+	ulint			i;
+#endif
+
+	/* Get master key from key ring */
+	Encryption::get_master_key(&master_key_id, &master_key, &version);
+	if (master_key == NULL) {
+		return(false);
+	}
+
+	memset(encrypt_info, 0, ENCRYPTION_INFO_SIZE_V2);
+	memset(key_info, 0, ENCRYPTION_KEY_LEN * 2);
+
+	/* Use the new master key to encrypt the tablespace
+	key. */
+	ut_ad(encrypt_info != NULL);
+	ptr = encrypt_info;
+
+	/* Write magic header. */
+	if (version == Encryption::ENCRYPTION_VERSION_1) {
+		memcpy(ptr, ENCRYPTION_KEY_MAGIC_V1, ENCRYPTION_MAGIC_SIZE);
+	} else {
+		memcpy(ptr, ENCRYPTION_KEY_MAGIC_V2, ENCRYPTION_MAGIC_SIZE);
+	}
+	ptr += ENCRYPTION_MAGIC_SIZE;
+
+	/* Write master key id. */
+	mach_write_to_4(ptr, master_key_id);
+	ptr += sizeof(ulint);
+
+	/* Write server uuid. */
+	if (version == Encryption::ENCRYPTION_VERSION_2) {
+		memcpy(ptr, Encryption::uuid, ENCRYPTION_SERVER_UUID_LEN);
+		ptr += ENCRYPTION_SERVER_UUID_LEN;
+	}
+
+	/* Write tablespace key to temp space. */
+	memcpy(key_info,
+	       space->encryption_key,
+	       ENCRYPTION_KEY_LEN);
+
+	/* Write tablespace iv to temp space. */
+	memcpy(key_info + ENCRYPTION_KEY_LEN,
+	       space->encryption_iv,
+	       ENCRYPTION_KEY_LEN);
+
+#ifdef	UNIV_ENCRYPT_DEBUG
+	fprintf(stderr, "Set %lu:%lu ",space->id,
+		Encryption::master_key_id);
+	for (data = (const byte*) master_key, i = 0;
+	     i < ENCRYPTION_KEY_LEN; i++)
+		fprintf(stderr, "%02lx", (ulong)*data++);
+	fprintf(stderr, " ");
+	for (data = (const byte*) space->encryption_key,
+	     i = 0; i < ENCRYPTION_KEY_LEN; i++)
+		fprintf(stderr, "%02lx", (ulong)*data++);
+	fprintf(stderr, " ");
+	for (data = (const byte*) space->encryption_iv,
+	     i = 0; i < ENCRYPTION_KEY_LEN; i++)
+		fprintf(stderr, "%02lx", (ulong)*data++);
+	fprintf(stderr, "\n");
+#endif
+	/* Encrypt tablespace key and iv. */
+	elen = my_aes_encrypt(
+		key_info,
+		ENCRYPTION_KEY_LEN * 2,
+		ptr,
+		master_key,
+		ENCRYPTION_KEY_LEN,
+		my_aes_256_ecb,
+		NULL, false);
+
+	if (elen == MY_AES_BAD_DATA) {
+		my_free(master_key);
+		return(false);
+	}
+
+	ptr += ENCRYPTION_KEY_LEN * 2;
+
+	/* Write checksum bytes. */
+	crc = ut_crc32(key_info, ENCRYPTION_KEY_LEN * 2);
+	mach_write_to_4(ptr, crc);
+
+	my_free(master_key);
+	return(true);
+}
+
+/** Rotate the encryption info in the space header.
+@param[in]	space		tablespace
+@param[in]      encrypt_info	buffer for re-encrypt key.
+@param[in,out]	mtr		mini-transaction
+@return true if success. */
+bool
+fsp_header_rotate_encryption(
+	fil_space_t*		space,
+	byte*			encrypt_info,
+	mtr_t*			mtr)
+{
+	buf_block_t*	block;
+	ulint		offset;
+	page_t*		page;
+	ulint		master_key_id;
+
+	ut_ad(mtr);
+	ut_ad(space->encryption_type != Encryption::NONE);
+
+	const page_size_t	page_size(space->flags);
+
+	/* Fill encryption info. */
+	if (!fsp_header_fill_encryption_info(space,
+					     encrypt_info)) {
+		return(false);
+	}
+
+	/* Save the encryption info to the page 0. */
+	block = buf_page_get(page_id_t(space->id, 0),
+			     page_size,
+			     RW_SX_LATCH, mtr);
+	buf_block_dbg_add_level(block, SYNC_FSP_PAGE);
+	ut_ad(space->id == page_get_space_id(buf_block_get_frame(block)));
+
+	offset = fsp_header_get_encryption_offset(page_size);
+	ut_ad(offset != 0 && offset < UNIV_PAGE_SIZE);
+
+	page = buf_block_get_frame(block);
+
+	/* If is in recovering, skip all master key id is rotated
+	tablespaces. */
+	master_key_id = mach_read_from_4(
+		page + offset + ENCRYPTION_MAGIC_SIZE);
+	if (recv_recovery_is_on()
+	    && master_key_id == Encryption::master_key_id) {
+		ut_ad(memcmp(page + offset,
+			     ENCRYPTION_KEY_MAGIC_V1,
+			     ENCRYPTION_MAGIC_SIZE) == 0
+		      || memcmp(page + offset,
+				ENCRYPTION_KEY_MAGIC_V2,
+				ENCRYPTION_MAGIC_SIZE) == 0);
+		return(true);
+	}
+
+	mlog_write_string(page + offset,
+			  encrypt_info,
+			  ENCRYPTION_INFO_SIZE_V2,
+			  mtr);
+
+	return(true);
+}
+
 /** Initializes the space header of a new created space and creates also the
 insert buffer tree root if space == 0.
 @param[in]	space_id	space id
@@ -907,6 +1107,29 @@ fsp_header_init(
 	fsp_fill_free_list(!is_system_tablespace(space_id),
 			   space, header, mtr);
 
+	/* For encryption tablespace, we need to save the encryption
+	info to the page 0. */
+	if (FSP_FLAGS_GET_ENCRYPTION(space->flags)) {
+		ulint	offset = fsp_header_get_encryption_offset(page_size);
+		byte	encryption_info[ENCRYPTION_INFO_SIZE_V2];
+
+		if (offset == 0)
+			return(false);
+
+		if (!fsp_header_fill_encryption_info(space,
+						     encryption_info)) {
+			space->encryption_type = Encryption::NONE;
+			memset(space->encryption_key, 0, ENCRYPTION_KEY_LEN);
+			memset(space->encryption_iv, 0, ENCRYPTION_KEY_LEN);
+			return(false);
+		}
+
+		mlog_write_string(page + offset,
+				  encryption_info,
+				  ENCRYPTION_INFO_SIZE_V2,
+				  mtr);
+	}
+
 	if (space_id == srv_sys_space.space_id()) {
 		if (btr_create(DICT_CLUSTERED | DICT_IBUF,
 			       0, univ_page_size, DICT_IBUF_ID_MIN + space_id,
@@ -954,6 +1177,164 @@ fsp_header_get_page_size(
 	const page_t*	page)
 {
 	return(page_size_t(fsp_header_get_flags(page)));
+}
+
+/** Decoding the encryption info
+from the first page of a tablespace.
+@param[in/out]	key		key
+@param[in/out]	iv		iv
+@param[in]	encryption_info	encrytion info.
+@return true if success */
+bool
+fsp_header_decode_encryption_info(
+	byte*		key,
+	byte*		iv,
+	byte*		encryption_info)
+{
+	byte*			ptr;
+	ulint			master_key_id;
+	byte*			master_key = NULL;
+	lint			elen;
+	byte			key_info[ENCRYPTION_KEY_LEN * 2];
+	ulint			crc1;
+	ulint			crc2;
+	char			srv_uuid[ENCRYPTION_SERVER_UUID_LEN + 1];
+	Encryption::Version	version;
+#ifdef	UNIV_ENCRYPT_DEBUG
+	const byte*		data;
+	ulint			i;
+#endif
+
+	ptr = encryption_info;
+
+	/* For compatibility with 5.7.11, we need to handle the
+	encryption information which created in this old version. */
+	if (memcmp(ptr, ENCRYPTION_KEY_MAGIC_V1,
+		     ENCRYPTION_MAGIC_SIZE) == 0) {
+		version = Encryption::ENCRYPTION_VERSION_1;
+	} else {
+		version = Encryption::ENCRYPTION_VERSION_2;
+	}
+
+	/* Check magic. */
+	if (version == Encryption::ENCRYPTION_VERSION_2
+	    && memcmp(ptr, ENCRYPTION_KEY_MAGIC_V2, ENCRYPTION_MAGIC_SIZE) != 0) {
+		/* We ignore report error for recovery,
+		since the encryption info maybe hasn't writen
+		into datafile when the table is newly created. */
+		if (!recv_recovery_is_on()) {
+			return(false);
+		} else {
+			return(true);
+		}
+	}
+	ptr += ENCRYPTION_MAGIC_SIZE;
+
+	/* Get master key id. */
+	master_key_id = mach_read_from_4(ptr);
+	ptr += sizeof(ulint);
+
+	/* Get server uuid. */
+	if (version == Encryption::ENCRYPTION_VERSION_2) {
+		memset(srv_uuid, 0, ENCRYPTION_SERVER_UUID_LEN + 1);
+		memcpy(srv_uuid, ptr, ENCRYPTION_SERVER_UUID_LEN);
+		ptr += ENCRYPTION_SERVER_UUID_LEN;
+	}
+
+	/* Get master key by key id. */
+	memset(key_info, 0, ENCRYPTION_KEY_LEN * 2);
+	if (version == Encryption::ENCRYPTION_VERSION_1) {
+		Encryption::get_master_key(master_key_id, NULL, &master_key);
+	} else {
+		Encryption::get_master_key(master_key_id, srv_uuid, &master_key);
+	}
+        if (master_key == NULL) {
+                return(false);
+        }
+
+#ifdef	UNIV_ENCRYPT_DEBUG
+	fprintf(stderr, "%lu ", master_key_id);
+	for (data = (const byte*) master_key, i = 0;
+	     i < ENCRYPTION_KEY_LEN; i++)
+		fprintf(stderr, "%02lx", (ulong)*data++);
+#endif
+
+	/* Decrypt tablespace key and iv. */
+	elen = my_aes_decrypt(
+		ptr,
+		ENCRYPTION_KEY_LEN * 2,
+		key_info,
+		master_key,
+		ENCRYPTION_KEY_LEN,
+		my_aes_256_ecb, NULL, false);
+
+	if (elen == MY_AES_BAD_DATA) {
+		my_free(master_key);
+		return(NULL);
+	}
+
+	/* Check checksum bytes. */
+	ptr += ENCRYPTION_KEY_LEN * 2;
+
+	crc1 = mach_read_from_4(ptr);
+	crc2 = ut_crc32(key_info, ENCRYPTION_KEY_LEN * 2);
+	if (crc1 != crc2) {
+		ib::error() << "Failed to decrpt encryption information,"
+			<< " please check key file is not changed!";
+		return(false);
+	}
+
+	/* Get tablespace key */
+	memcpy(key, key_info, ENCRYPTION_KEY_LEN);
+
+	/* Get tablespace iv */
+	memcpy(iv, key_info + ENCRYPTION_KEY_LEN,
+	       ENCRYPTION_KEY_LEN);
+
+#ifdef	UNIV_ENCRYPT_DEBUG
+	fprintf(stderr, " ");
+	for (data = (const byte*) key,
+	     i = 0; i < ENCRYPTION_KEY_LEN; i++)
+		fprintf(stderr, "%02lx", (ulong)*data++);
+	fprintf(stderr, " ");
+	for (data = (const byte*) iv,
+	     i = 0; i < ENCRYPTION_KEY_LEN; i++)
+		fprintf(stderr, "%02lx", (ulong)*data++);
+	fprintf(stderr, "\n");
+#endif
+
+	my_free(master_key);
+
+	if (Encryption::master_key_id < master_key_id) {
+		Encryption::master_key_id = master_key_id;
+		memcpy(Encryption::uuid, srv_uuid, ENCRYPTION_SERVER_UUID_LEN);
+	}
+
+	return(true);
+}
+
+/** Reads the encryption key from the first page of a tablespace.
+@param[in]	fsp_flags	tablespace flags
+@param[in/out]	key		tablespace key
+@param[in/out]	iv		tablespace iv
+@param[in]	page	first page of a tablespace
+@return true if success */
+bool
+fsp_header_get_encryption_key(
+	ulint		fsp_flags,
+	byte*		key,
+	byte*		iv,
+	page_t*		page)
+{
+	ulint			offset;
+	const page_size_t	page_size(fsp_flags);
+
+	offset = fsp_header_get_encryption_offset(page_size);
+	if (offset == 0) {
+		return(false);
+	}
+
+	return(fsp_header_decode_encryption_info(key, iv, page + offset));
 }
 
 #ifndef UNIV_HOTBACKUP
@@ -1024,7 +1405,7 @@ data file.
 @param[in,out]	header	tablespace header
 @param[in,out]	mtr	mini-transaction
 @return true if success */
-static UNIV_COLD __attribute__((warn_unused_result))
+static UNIV_COLD MY_ATTRIBUTE((warn_unused_result))
 bool
 fsp_try_extend_data_file_with_pages(
 	fil_space_t*	space,
@@ -1056,7 +1437,7 @@ fsp_try_extend_data_file_with_pages(
 @param[in,out]	header	tablespace header
 @param[in,out]	mtr	mini-transaction
 @return whether the tablespace was extended */
-static UNIV_COLD __attribute__((nonnull))
+static UNIV_COLD MY_ATTRIBUTE((nonnull))
 ulint
 fsp_try_extend_data_file(
 	fil_space_t*	space,
@@ -1421,7 +1802,7 @@ fsp_alloc_free_extent(
 
 /**********************************************************************//**
 Allocates a single free page from a space. */
-static __attribute__((nonnull))
+static MY_ATTRIBUTE((nonnull))
 void
 fsp_alloc_from_free_frag(
 /*=====================*/
@@ -1531,7 +1912,7 @@ initialized (may be the same as mtr)
 @retval block	rw_lock_x_lock_count(&block->lock) == 1 if allocation succeeded
 (init_mtr == mtr, or the page was not previously freed in mtr)
 @retval block	(not allocated or initialized) otherwise */
-static __attribute__((warn_unused_result))
+static MY_ATTRIBUTE((warn_unused_result))
 buf_block_t*
 fsp_alloc_free_page(
 	ulint			space,
@@ -2082,7 +2463,7 @@ fseg_get_nth_frag_page_no(
 /*======================*/
 	fseg_inode_t*	inode,	/*!< in: segment inode */
 	ulint		n,	/*!< in: slot index */
-	mtr_t*		mtr __attribute__((unused)))
+	mtr_t*		mtr MY_ATTRIBUTE((unused)))
 				/*!< in/out: mini-transaction */
 {
 	ut_ad(inode && mtr);
@@ -3125,7 +3506,7 @@ fsp_get_available_space_in_free_extents(
 /********************************************************************//**
 Marks a page used. The page must reside within the extents of the given
 segment. */
-static __attribute__((nonnull))
+static MY_ATTRIBUTE((nonnull))
 void
 fseg_mark_page_used(
 /*================*/
@@ -3368,7 +3749,7 @@ fseg_page_is_free(
 
 /**********************************************************************//**
 Frees an extent of a segment to the space free list. */
-static __attribute__((nonnull))
+static MY_ATTRIBUTE((nonnull))
 void
 fseg_free_extent(
 /*=============*/

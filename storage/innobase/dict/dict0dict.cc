@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1996, 2015, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1996, 2016, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2012, Facebook Inc.
 
 This program is free software; you can redistribute it and/or modify it under
@@ -1184,7 +1184,7 @@ dict_init(void)
 		       dict_operation_lock, SYNC_DICT_OPERATION);
 
 	if (!srv_read_only_mode) {
-		dict_foreign_err_file = os_file_create_tmpfile();
+		dict_foreign_err_file = os_file_create_tmpfile(NULL);
 		ut_a(dict_foreign_err_file);
 	}
 
@@ -2633,11 +2633,25 @@ dict_index_add_to_cache_w_vcol(
 		const dict_field_t*	field
 			= dict_index_get_nth_field(new_index, i);
 
-		field->col->ord_part = 1;
-
-		if (field->prefix_len > field->col->max_prefix) {
+		/* Check the column being added in the index for
+		the first time and flag the ordering column. */
+		if (field->col->ord_part == 0 ) {
+			field->col->max_prefix = field->prefix_len;
+			field->col->ord_part = 1;
+		} else if (field->prefix_len == 0) {
+			/* Set the max_prefix for a column to 0 if
+			its prefix length is 0 (for this index)
+			even if it was a part of any other index
+			with some prefix length. */
+			field->col->max_prefix = 0;
+		} else if (field->col->max_prefix != 0
+			   && field->prefix_len
+			   > field->col->max_prefix) {
+			/* Set the max_prefix value based on the
+			prefix_len. */
 			field->col->max_prefix = field->prefix_len;
 		}
+		ut_ad(field->col->ord_part == 1);
 	}
 
 	new_index->stat_n_diff_key_vals =
@@ -4596,8 +4610,8 @@ loop:
 			return(DB_CANNOT_ADD_CONSTRAINT);
 		}
 
-		if (dict_foreigns_has_v_base_col(local_fk_set, table)) {
-			return(DB_NO_FK_ON_V_BASE_COL);
+		if (dict_foreigns_has_s_base_col(local_fk_set, table)) {
+			return(DB_NO_FK_ON_S_BASE_COL);
 		}
 
 		/**********************************************************/
@@ -4615,6 +4629,8 @@ loop:
 				      local_fk_set.end(),
 				      dict_foreign_add_to_referenced_table());
 			local_fk_set.clear();
+
+			dict_mem_table_fill_foreign_vcol_set(table);
 		}
 		return(error);
 	}
@@ -5397,6 +5413,12 @@ dict_index_copy_rec_order_prefix(
 			n = dict_index_get_n_unique_in_tree(index);
 		} else {
 			n = dict_index_get_n_unique_in_tree_nonleaf(index);
+			/* For internal node of R-tree, since we need to
+			compare the page no field, so, we need to copy this
+			field as well. */
+			if (dict_index_is_spatial(index)) {
+				n++;
+			}
 		}
 	}
 
@@ -5776,6 +5798,13 @@ dict_set_corrupted(
 	if (index->type & DICT_CORRUPT) {
 		/* The index was already flagged corrupted. */
 		ut_ad(!dict_index_is_clust(index) || index->table->corrupted);
+		goto func_exit;
+	}
+
+	/* If this is read only mode, do not update SYS_INDEXES, just
+	mark it as corrupted in memory */
+	if (srv_read_only_mode) {
+		index->type |= DICT_CORRUPT;
 		goto func_exit;
 	}
 
@@ -6844,11 +6873,13 @@ dict_table_t::flags |     0     |    1    |     1      |    1
 fil_space_t::flags  |     0     |    0    |     1      |    1
 @param[in]	table_flags	dict_table_t::flags
 @param[in]	is_temp		whether the tablespace is temporary
+@param[in]	is_encrypted	whether the tablespace is encrypted
 @return tablespace flags (fil_space_t::flags) */
 ulint
 dict_tf_to_fsp_flags(
 	ulint	table_flags,
-	bool	is_temp)
+	bool	is_temp,
+	bool	is_encrypted)
 {
 	DBUG_EXECUTE_IF("dict_tf_to_fsp_flags_failure",
 			return(ULINT_UNDEFINED););
@@ -6871,7 +6902,8 @@ dict_tf_to_fsp_flags(
 						   has_atomic_blobs,
 						   has_data_dir,
 						   is_shared,
-						   is_temp);
+						   is_temp,
+						   is_encrypted);
 
 	return(fsp_flags);
 }
@@ -6900,10 +6932,10 @@ dict_tf_to_row_format_string(
 }
 
 /** Look for any dictionary objects that are found in the given tablespace.
-@param[in]	space	Tablespace ID to search for.
+@param[in]	space_id	Tablespace ID to search for.
 @return true if tablespace is empty. */
 bool
-dict_tablespace_is_empty(
+dict_space_is_empty(
 	ulint	space_id)
 {
 	btr_pcur_t	pcur;
@@ -6937,6 +6969,55 @@ dict_tablespace_is_empty(
 	rw_lock_x_unlock(dict_operation_lock);
 
 	return(!found);
+}
+
+/** Find the space_id for the given name in sys_tablespaces.
+@param[in]	name	Tablespace name to search for.
+@return the tablespace ID. */
+ulint
+dict_space_get_id(
+	const char*	name)
+{
+	btr_pcur_t	pcur;
+	const rec_t*	rec;
+	mtr_t		mtr;
+	ulint		name_len = strlen(name);
+	ulint		id = ULINT_UNDEFINED;
+
+	rw_lock_x_lock(dict_operation_lock);
+	mutex_enter(&dict_sys->mutex);
+	mtr_start(&mtr);
+
+	for (rec = dict_startscan_system(&pcur, &mtr, SYS_TABLESPACES);
+	     rec != NULL;
+	     rec = dict_getnext_system(&pcur, &mtr)) {
+		const byte*	field;
+		ulint		len;
+
+		field = rec_get_nth_field_old(
+			rec, DICT_FLD__SYS_TABLESPACES__NAME, &len);
+		ut_ad(len > 0);
+		ut_ad(len < OS_FILE_MAX_PATH);
+
+		if (len == name_len && ut_memcmp(name, field, len) == 0) {
+
+			field = rec_get_nth_field_old(
+				rec, DICT_FLD__SYS_TABLESPACES__SPACE, &len);
+			ut_ad(len == 4);
+			id = mach_read_from_4(field);
+
+			/* This is normally called by dict_getnext_system()
+			at the end of the index. */
+			btr_pcur_close(&pcur);
+			break;
+		}
+	}
+
+	mtr_commit(&mtr);
+	mutex_exit(&dict_sys->mutex);
+	rw_lock_x_unlock(dict_operation_lock);
+
+	return(id);
 }
 #endif /* !UNIV_HOTBACKUP */
 

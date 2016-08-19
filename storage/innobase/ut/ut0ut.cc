@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1994, 2015, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1994, 2016, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -47,9 +47,6 @@ Created 5/11/1994 Heikki Tuuri
 #endif /* !UNIV_HOTBACKUP */
 
 #include "log.h"
-
-/** A constant to prevent the compiler from optimizing ut_delay() away. */
-ibool	ut_always_false	= FALSE;
 
 #ifdef _WIN32
 /*****************************************************************//**
@@ -227,14 +224,14 @@ ut_print_timestamp(
 
 	GetLocalTime(&cal_tm);
 
-	fprintf(file, "%d-%02d-%02d %02d:%02d:%02d %#lx",
+	fprintf(file, "%d-%02d-%02d %02d:%02d:%02d %#llx",
 		(int) cal_tm.wYear,
 		(int) cal_tm.wMonth,
 		(int) cal_tm.wDay,
 		(int) cal_tm.wHour,
 		(int) cal_tm.wMinute,
 		(int) cal_tm.wSecond,
-		thread_id);
+		static_cast<ulonglong>(thread_id));
 #else
 	struct tm* cal_tm_ptr;
 	time_t	   tm;
@@ -385,10 +382,6 @@ ut_delay(
 		UT_RELAX_CPU();
 	}
 
-	if (ut_always_false) {
-		ut_always_false = (ibool) j;
-	}
-
 	UT_RESUME_PRIORITY_CPU();
 
 	return(j);
@@ -409,10 +402,10 @@ ut_print_buf(
 
 	UNIV_MEM_ASSERT_RW(buf, len);
 
-	fprintf(file, " len %lu; hex ", len);
+	fprintf(file, " len " ULINTPF "; hex ", len);
 
 	for (data = (const byte*) buf, i = 0; i < len; i++) {
-		fprintf(file, "%02lx", (ulong)*data++);
+		fprintf(file, "%02lx", static_cast<ulong>(*data++));
 	}
 
 	fputs("; asc ", file);
@@ -819,6 +812,10 @@ ut_strerr(
 		return("Punch hole not supported by the file system");
 	case DB_IO_NO_PUNCH_HOLE_TABLESPACE:
 		return("Punch hole not supported by the tablespace");
+	case DB_IO_NO_ENCRYPT_TABLESPACE:
+		return("Page encryption not supported by the tablespace");
+	case DB_IO_DECRYPT_FAIL:
+		return("Page decryption failed after reading from disk");
 	case DB_IO_PARTIAL_FAILED:
 		return("Partial IO failed");
 	case DB_FORCED_ABORT:
@@ -826,13 +823,9 @@ ut_strerr(
 		       "transaction");
 	case DB_WRONG_FILE_NAME:
 		return("Invalid Filename");
-	case DB_NO_FK_ON_V_BASE_COL:
+	case DB_NO_FK_ON_S_BASE_COL:
 		return("Cannot add foreign key on the base column "
-		       "of indexed virtual column");
-	case DB_NO_VIRTUAL_INDEX_ON_FK:
-		return("Cannot create index on virtual column whose base "
-		       "column has foreign constraint");
-
+		       "of stored column");
 	case DB_COMPUTE_VALUE_FAILED:
 		return("Compute generated column failed");
 

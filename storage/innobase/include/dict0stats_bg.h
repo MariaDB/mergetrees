@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 2012, 2015, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2012, 2016, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -81,7 +81,7 @@ bool
 dict_stats_stop_bg(
 /*===============*/
 	dict_table_t*	table)	/*!< in/out: table */
-	__attribute__((warn_unused_result));
+	MY_ATTRIBUTE((warn_unused_result));
 
 /*****************************************************************//**
 Wait until background stats thread has stopped using the specified table.
@@ -138,6 +138,10 @@ DECLARE_THREAD(dict_stats_thread)(
 /*==============================*/
 	void*	arg);	/*!< in: a dummy parameter
 			required by os_thread_create */
+
+/** Shutdown the dict stats thread. */
+void
+dict_stats_shutdown();
 
 # ifndef UNIV_NONINL
 #  include "dict0stats_bg.ic"

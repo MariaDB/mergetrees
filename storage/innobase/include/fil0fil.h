@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2015, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1995, 2016, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -219,6 +219,18 @@ struct fil_space_t {
 	/** Compression algorithm */
 	Compression::Type	compression_type;
 
+	/** Encryption algorithm */
+	Encryption::Type	encryption_type;
+
+	/** Encrypt key */
+	byte			encryption_key[ENCRYPTION_KEY_LEN];
+
+	/** Encrypt key length*/
+	ulint			encryption_klen;
+
+	/** Encrypt initial vector */
+	byte			encryption_iv[ENCRYPTION_KEY_LEN];
+
 	/** Release the reserved free extents.
 	@param[in]	n_reserved	number of reserved extents */
 	void release_free_extents(ulint n_reserved);
@@ -231,54 +243,53 @@ struct fil_space_t {
 
 /** File node of a tablespace or the log data space */
 struct fil_node_t {
-	fil_space_t*	space;	/*!< backpointer to the space where this node
-				belongs */
-	char*		name;	/*!< path to the file */
-	bool		is_open;/*!< true if file is open */
-	os_file_t	handle;	/*!< OS handle to the file, if file open */
-	os_event_t	sync_event;/*!< Condition event to group and
-				serialize calls to fsync */
-	bool		is_raw_disk;/*!< true if the 'file' is actually a raw
-				device or a raw disk partition */
-	ulint		size;	/*!< size of the file in database pages, 0 if
-				not known yet; the possible last incomplete
-				megabyte may be ignored if space == 0 */
+	/** tablespace containing this file */
+	fil_space_t*	space;
+	/** file name; protected by fil_system->mutex and log_sys->mutex. */
+	char*		name;
+	/** whether this file is open */
+	bool		is_open;
+	/** file handle (valid if is_open) */
+	os_file_t	handle;
+	/** event that groups and serializes calls to fsync */
+	os_event_t	sync_event;
+	/** whether the file actually is a raw device or disk partition */
+	bool		is_raw_disk;
+	/** size of the file in database pages (0 if not known yet);
+	the possible last incomplete megabyte may be ignored
+	if space->id == 0 */
+	ulint		size;
+	/** initial size of the file in database pages;
+	FIL_IBD_FILE_INITIAL_SIZE by default */
 	ulint		init_size;
-				/*!< initial size of the file in database pages,
-				defaults to FIL_IBD_FILE_INITIAL_SIZE. */
+	/** maximum size of the file in database pages (0 if unlimited) */
 	ulint		max_size;
-				/*!< maximum size of the file in database pages;
-				0 if there is no maximum size. */
+	/** count of pending i/o's; is_open must be true if nonzero */
 	ulint		n_pending;
-				/*!< count of pending i/o's on this file;
-				closing of the file is not allowed if
-				this is > 0 */
+	/** count of pending flushes; is_open must be true if nonzero */
 	ulint		n_pending_flushes;
-				/*!< count of pending flushes on this file;
-				closing of the file is not allowed if
-				this is > 0 */
+	/** whether the file is currently being extended */
 	bool		being_extended;
-				/*!< true if the node is currently
-				being extended. */
-	int64_t		modification_counter;/*!< when we write to the file we
-				increment this by one */
-	int64_t		flush_counter;/*!< up to what
-				modification_counter value we have
-				flushed the modifications to disk */
+	/** number of writes to the file since the system was started */
+	int64_t		modification_counter;
+	/** the modification_counter of the latest flush to disk */
+	int64_t		flush_counter;
+	/** link to other files in this tablespace */
 	UT_LIST_NODE_T(fil_node_t) chain;
-				/*!< link field for the file chain */
+	/** link to the fil_system->LRU list (keeping track of open files) */
 	UT_LIST_NODE_T(fil_node_t) LRU;
-				/*!< link field for the LRU list */
-	ulint		magic_n;/*!< FIL_NODE_MAGIC_N */
 
-	/** true if the FS where the file is located supports PUNCH HOLE */
+	/** whether the file system of this file supports PUNCH HOLE */
 	bool		punch_hole;
 
-	/** Block size to use for punching holes */
+	/** block size to use for punching holes */
 	ulint           block_size;
 
-	/** True if atomic write is enabled for this file */
+	/** whether atomic write is enabled for this file */
 	bool		atomic_write;
+
+	/** FIL_NODE_MAGIC_N */
+	ulint		magic_n;
 };
 
 /** Value of fil_node_t::magic_n */
@@ -289,12 +300,14 @@ enum ib_extention {
 	NO_EXT = 0,
 	IBD = 1,
 	ISL = 2,
-	CFG = 3
+	CFG = 3,
+	CFP = 4
 };
 extern const char* dot_ext[];
 #define DOT_IBD dot_ext[IBD]
 #define DOT_ISL dot_ext[ISL]
 #define DOT_CFG dot_ext[CFG]
+#define DOT_CPF dot_ext[CFP]
 
 /** Wrapper for a path to a directory.
 This folder may or may not yet esist.  Since not all directory paths
@@ -527,6 +540,10 @@ static const ulint FIL_PAGE_COMPRESS_SIZE_V1 = FIL_PAGE_ORIGINAL_SIZE_V1 + 2;
 					in FIL_PAGE_TYPE is replaced with this
 					value when flushing pages. */
 #define FIL_PAGE_COMPRESSED	14	/*!< Compressed page */
+#define FIL_PAGE_ENCRYPTED	15	/*!< Encrypted page */
+#define FIL_PAGE_COMPRESSED_AND_ENCRYPTED 16
+					/*!< Compressed and Encrypted page */
+#define FIL_PAGE_ENCRYPTED_RTREE 17	/*!< Encrypted R-tree page */
 
 /** Used by i_s.cc to index into the text description. */
 #define FIL_PAGE_TYPE_LAST	FIL_PAGE_TYPE_UNKNOWN
@@ -567,7 +584,7 @@ should be used instead.
 fil_space_t*
 fil_space_get(
 	ulint	id)
-	__attribute__((warn_unused_result));
+	MY_ATTRIBUTE((warn_unused_result));
 #ifndef UNIV_HOTBACKUP
 /** Returns the latch of a file space.
 @param[in]	id	space id
@@ -603,7 +620,7 @@ fil_space_set_imported(
 @return whether it is a temporary tablespace */
 bool
 fsp_is_temporary(ulint id)
-__attribute__((warn_unused_result, pure));
+MY_ATTRIBUTE((warn_unused_result, pure));
 # endif /* UNIV_DEBUG */
 #endif /* !UNIV_HOTBACKUP */
 
@@ -625,7 +642,7 @@ fil_node_create(
 	bool		is_raw,
 	bool		atomic_write,
 	ulint		max_pages = ULINT_MAX)
-	__attribute__((warn_unused_result));
+	MY_ATTRIBUTE((warn_unused_result));
 
 /** Create a space memory object and put it to the fil_system hash table.
 The tablespace name is independent from the tablespace file-name.
@@ -642,7 +659,7 @@ fil_space_create(
 	ulint		id,
 	ulint		flags,
 	fil_type_t	purpose)
-	__attribute__((warn_unused_result));
+	MY_ATTRIBUTE((warn_unused_result));
 
 /*******************************************************************//**
 Assigns a new space id for a new single-table tablespace. This works simply by
@@ -780,7 +797,7 @@ for concurrency control.
 fil_space_t*
 fil_space_acquire(
 	ulint	id)
-	__attribute__((warn_unused_result));
+	MY_ATTRIBUTE((warn_unused_result));
 
 /** Acquire a tablespace that may not exist.
 Used by background threads that do not necessarily hold proper locks
@@ -790,7 +807,7 @@ for concurrency control.
 fil_space_t*
 fil_space_acquire_silent(
 	ulint	id)
-	__attribute__((warn_unused_result));
+	MY_ATTRIBUTE((warn_unused_result));
 
 /** Release a tablespace acquired with fil_space_acquire().
 @param[in,out]	space	tablespace to release  */
@@ -903,7 +920,7 @@ fil_op_replay_rename(
 	ulint		first_page_no,
 	const char*	name,
 	const char*	new_name)
-	__attribute__((warn_unused_result));
+	MY_ATTRIBUTE((warn_unused_result));
 
 /** Deletes an IBD tablespace, either general or single-table.
 The tablespace must be cached in the memory cache. This will delete the
@@ -972,7 +989,7 @@ dberr_t
 fil_discard_tablespace(
 /*===================*/
 	ulint	id)	/*!< in: space id */
-	__attribute__((warn_unused_result));
+	MY_ATTRIBUTE((warn_unused_result));
 #endif /* !UNIV_HOTBACKUP */
 
 /** Test if a tablespace file can be renamed to a new filepath by checking
@@ -1035,7 +1052,7 @@ fil_ibd_create(
 	const char*	path,
 	ulint		flags,
 	ulint		size)
-	__attribute__((warn_unused_result));
+	MY_ATTRIBUTE((warn_unused_result));
 /********************************************************************//**
 Tries to open a single-table tablespace and optionally checks the space id is
 right in it. If does not succeed, prints an error message to the .err log. This
@@ -1074,7 +1091,7 @@ fil_ibd_open(
 	ulint		flags,
 	const char*	tablename,
 	const char*	path_in)
-	__attribute__((warn_unused_result));
+	MY_ATTRIBUTE((warn_unused_result));
 
 enum fil_load_status {
 	/** The tablespace file(s) were found and valid. */
@@ -1097,7 +1114,7 @@ fil_ibd_load(
 	ulint		space_id,
 	const char*	filename,
 	fil_space_t*&	space)
-	__attribute__((warn_unused_result));
+	MY_ATTRIBUTE((warn_unused_result));
 
 /***********************************************************************//**
 A fault-tolerant function that tries to read the next file name in the
@@ -1398,6 +1415,10 @@ struct PageCallback {
 	@return the space id of the tablespace */
 	virtual ulint get_space_id() const UNIV_NOTHROW = 0;
 
+	/**
+	@retval the space flags of the tablespace being iterated over */
+	virtual ulint get_space_flags() const UNIV_NOTHROW = 0;
+
 	/** Set the tablespace table size.
 	@param[in] page a page belonging to the tablespace */
 	void set_page_size(const buf_frame_t* page) UNIV_NOTHROW;
@@ -1436,7 +1457,7 @@ fil_tablespace_iterate(
 	dict_table_t*		table,
 	ulint			n_io_buffers,
 	PageCallback&		callback)
-	__attribute__((warn_unused_result));
+	MY_ATTRIBUTE((warn_unused_result));
 
 /********************************************************************//**
 Looks for a pre-existing fil_space_t with the given tablespace ID
@@ -1477,7 +1498,7 @@ fil_get_space_names(
 /*================*/
 	space_name_list_t&	space_name_list)
 				/*!< in/out: Vector for collecting the names. */
-	__attribute__((warn_unused_result));
+	MY_ATTRIBUTE((warn_unused_result));
 
 /** Return the next fil_node_t in the current or next fil_space_t.
 Once started, the caller must keep calling this until it returns NULL.
@@ -1503,7 +1524,7 @@ fil_mtr_rename_log(
 	const dict_table_t*	new_table,
 	const char*		tmp_name,
 	mtr_t*			mtr)
-	__attribute__((warn_unused_result));
+	MY_ATTRIBUTE((warn_unused_result));
 
 /** Note that a non-predefined persistent tablespace has been modified
 by redo log.
@@ -1522,30 +1543,49 @@ fil_names_dirty_and_write(
 	fil_space_t*	space,
 	mtr_t*		mtr);
 
-/** Set the compression type for the tablespace
-@param[in] space		Space ID of tablespace for which to set
-@param[in] algorithm		Text representation of the algorithm
+/** Set the compression type for the tablespace of a table
+@param[in]	table		Table that should be compressesed
+@param[in]	algorithm	Text representation of the algorithm
 @return DB_SUCCESS or error code */
 dberr_t
 fil_set_compression(
-	ulint		space_id,
+	dict_table_t*	table,
 	const char*	algorithm)
-	__attribute__((warn_unused_result));
+	MY_ATTRIBUTE((warn_unused_result));
 
-/**
-@param[in]      space_id        Space ID to check
+/** Get the compression type for the tablespace
+@param[in]	space_id	Space ID to check
 @return the compression algorithm */
 Compression::Type
 fil_get_compression(
-        ulint           space_id)
-	__attribute__((warn_unused_result));
+	ulint		space_id)
+	MY_ATTRIBUTE((warn_unused_result));
+
+/** Set the encryption type for the tablespace
+@param[in] space		Space ID of tablespace for which to set
+@param[in] algorithm		Encryption algorithm
+@param[in] key			Encryption key
+@param[in] iv			Encryption iv
+@return DB_SUCCESS or error code */
+dberr_t
+fil_set_encryption(
+	ulint			space_id,
+	Encryption::Type	algorithm,
+	byte*			key,
+	byte*			iv)
+	MY_ATTRIBUTE((warn_unused_result));
+
+/**
+@return true if the re-encrypt success */
+bool
+fil_encryption_rotate();
 
 /** Write MLOG_FILE_NAME records if a persistent tablespace was modified
 for the first time since the latest fil_names_clear().
 @param[in,out]	space	tablespace
 @param[in,out]	mtr	mini-transaction
 @return whether any MLOG_FILE_NAME record was written */
-inline __attribute__((warn_unused_result))
+inline MY_ATTRIBUTE((warn_unused_result))
 bool
 fil_names_write_if_was_clean(
 	fil_space_t*	space,

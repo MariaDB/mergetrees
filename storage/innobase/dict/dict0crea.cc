@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1996, 2015, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1996, 2016, Oracle and/or its affiliates. All Rights Reserved.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -348,7 +348,7 @@ dict_create_sys_virtual_tuple(
 /***************************************************************//**
 Builds a table definition to insert.
 @return DB_SUCCESS or error code */
-static __attribute__((nonnull, warn_unused_result))
+static MY_ATTRIBUTE((nonnull, warn_unused_result))
 dberr_t
 dict_build_table_def_step(
 /*======================*/
@@ -435,9 +435,12 @@ dict_build_tablespace(
 	mtr_set_log_mode(&mtr, MTR_LOG_NO_REDO); */
 	ut_a(!FSP_FLAGS_GET_TEMPORARY(tablespace->flags()));
 
-	fsp_header_init(space, FIL_IBD_FILE_INITIAL_SIZE, &mtr);
-
+	bool ret = fsp_header_init(space, FIL_IBD_FILE_INITIAL_SIZE, &mtr);
 	mtr_commit(&mtr);
+
+	if (!ret) {
+		return(DB_ERROR);
+	}
 
 	return(err);
 }
@@ -488,8 +491,11 @@ dict_build_tablespace_for_table(
 
 		/* Determine the tablespace flags. */
 		bool	is_temp = dict_table_is_temporary(table);
+		bool	is_encrypted = dict_table_is_encrypted(table);
 		bool	has_data_dir = DICT_TF_HAS_DATA_DIR(table->flags);
-		ulint	fsp_flags = dict_tf_to_fsp_flags(table->flags, is_temp);
+		ulint	fsp_flags = dict_tf_to_fsp_flags(table->flags,
+							 is_temp,
+							 is_encrypted);
 
 		/* Determine the full filepath */
 		if (is_temp) {
@@ -536,9 +542,14 @@ dict_build_tablespace_for_table(
 		mtr.set_named_space(table->space);
 		dict_disable_redo_if_temporary(table, &mtr);
 
-		fsp_header_init(table->space, FIL_IBD_FILE_INITIAL_SIZE, &mtr);
+		bool ret = fsp_header_init(table->space,
+					   FIL_IBD_FILE_INITIAL_SIZE,
+					   &mtr);
 
 		mtr_commit(&mtr);
+		if (!ret) {
+			return(DB_ERROR);
+		}
 	} else {
 		/* We do not need to build a tablespace for this table. It
 		is already built.  Just find the correct tablespace ID. */
@@ -840,7 +851,7 @@ dict_create_search_tuple(
 /***************************************************************//**
 Builds an index definition row to insert.
 @return DB_SUCCESS or error code */
-static __attribute__((nonnull, warn_unused_result))
+static MY_ATTRIBUTE((nonnull, warn_unused_result))
 dberr_t
 dict_build_index_def_step(
 /*======================*/
@@ -957,7 +968,7 @@ dict_build_field_def_step(
 /***************************************************************//**
 Creates an index tree for the index if it is not a member of a cluster.
 @return DB_SUCCESS or DB_OUT_OF_FILE_SPACE */
-static __attribute__((nonnull, warn_unused_result))
+static MY_ATTRIBUTE((nonnull, warn_unused_result))
 dberr_t
 dict_create_index_tree_step(
 /*========================*/
@@ -1982,7 +1993,7 @@ dict_create_or_check_sys_virtual()
 /****************************************************************//**
 Evaluate the given foreign key SQL statement.
 @return error code or DB_SUCCESS */
-static __attribute__((nonnull, warn_unused_result))
+static MY_ATTRIBUTE((nonnull, warn_unused_result))
 dberr_t
 dict_foreign_eval_sql(
 /*==================*/
@@ -2047,7 +2058,7 @@ dict_foreign_eval_sql(
 Add a single foreign key field definition to the data dictionary tables in
 the database.
 @return error code or DB_SUCCESS */
-static __attribute__((nonnull, warn_unused_result))
+static MY_ATTRIBUTE((nonnull, warn_unused_result))
 dberr_t
 dict_create_add_foreign_field_to_dictionary(
 /*========================================*/
@@ -2216,25 +2227,56 @@ dict_foreign_has_col_as_base_col(
 	return(false);
 }
 
-/** Check if a foreign constraint is on columns served as based columns
-of some virtual column, or the column is part of virtual index (index
-that contains virtual column). This is to prevent creating SET NULL or
-CASCADE constraint on such columns
+/** Check if a foreign constraint is on the given column name.
+@param[in]	col_name	column name to be searched for fk constraint
+@param[in]	table		table to which foreign key constraint belongs
+@return true if fk constraint is present on the table, false otherwise. */
+static
+bool
+dict_foreign_base_for_stored(
+	const char*		col_name,
+	const dict_table_t*	table)
+{
+	/* Loop through each stored column and check if its base column has
+	the same name as the column name being checked */
+	dict_s_col_list::const_iterator	it;
+	for (it = table->s_cols->begin();
+	     it != table->s_cols->end(); ++it) {
+		dict_s_col_t	s_col = *it;
+
+		for (ulint j = 0; j < s_col.num_base; j++) {
+			if (strcmp(col_name, dict_table_get_col_name(
+						table,
+						s_col.base_col[j]->ind)) == 0) {
+				return(true);
+			}
+		}
+	}
+
+	return(false);
+}
+
+/** Check if a foreign constraint is on columns served as base columns
+of any stored column. This is to prevent creating SET NULL or CASCADE
+constraint on such columns
 @param[in]	local_fk_set	set of foreign key objects, to be added to
 the dictionary tables
 @param[in]	table		table to which the foreign key objects in
 local_fk_set belong to
 @return true if yes, otherwise, false */
 bool
-dict_foreigns_has_v_base_col(
+dict_foreigns_has_s_base_col(
 	const dict_foreign_set&	local_fk_set,
 	const dict_table_t*	table)
 {
 	dict_foreign_t*	foreign;
 
+	if (table->s_cols == NULL) {
+		return (false);
+	}
+
 	for (dict_foreign_set::const_iterator it = local_fk_set.begin();
-	     it != local_fk_set.end();
-	     ++it) {
+	     it != local_fk_set.end(); ++it) {
 
 		foreign = *it;
 		ulint	type = foreign->type;
@@ -2248,20 +2290,14 @@ dict_foreigns_has_v_base_col(
 
 		for (ulint i = 0; i < foreign->n_fields; i++) {
 			/* Check if the constraint is on a column that
-			is a base column of some virtual column */
-			if (dict_foreign_has_col_as_base_col(
-				    foreign->foreign_col_names[i], table)) {
-				return(true);
-			}
-
-			/* Check if the column is part of a virtual index (
-			index contains virtual columns) */
-			if (dict_foreign_has_col_in_v_index(
+			is a base column of any stored column */
+			if (dict_foreign_base_for_stored(
 				foreign->foreign_col_names[i], table)) {
 				return(true);
 			}
 		}
 	}
+
 	return(false);
 }
 
@@ -2299,29 +2335,6 @@ dict_foreigns_has_this_col(
 			}
 		}
 	}
-	return(false);
-}
-
-/** Check if a virtual column could have base columns in foreign constraints,
-this is to prevent creating virtual index on such column
-@param[in]	table	table
-@param[in]	v_col_n	virtual column number for the virtual column to check
-@return true if the virtual column could have base columns in constraint */
-bool
-dict_table_has_base_in_foreign(
-	const dict_table_t*	table,
-	ulint			v_col_n)
-{
-	const dict_v_col_t*	v_col = dict_table_get_nth_v_col(table, v_col_n);
-
-	for (ulint j = 0; j < v_col->num_base; j++) {
-		if (dict_foreigns_has_this_col(
-			    table, dict_table_get_col_name(
-				    table, v_col->base_col[j]->ind))) {
-			return(true);
-		}
-	}
-
 	return(false);
 }
 
