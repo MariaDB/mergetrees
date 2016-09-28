@@ -48,19 +48,6 @@ this program; if not, write to the Free Software Foundation, Inc.,
 		DBUG_RETURN(1);	\
 	}
 
-#define RETURN_IF_INNODB_NOT_STARTED(plugin_name)			\
-do {									\
-	if (!srv_was_started) {						\
-		push_warning_printf(thd, Sql_condition::WARN_LEVEL_WARN,	\
-				    ER_CANT_FIND_SYSTEM_REC,		\
-				    "InnoDB: SELECTing from "		\
-				    "INFORMATION_SCHEMA.%s but "	\
-				    "the InnoDB storage engine "	\
-				    "is not installed", plugin_name);	\
-		DBUG_RETURN(0);						\
-	}								\
-} while (0)
-
 #if !defined __STRICT_ANSI__ && defined __GNUC__ && (__GNUC__) > 2 &&	\
 	!defined __INTEL_COMPILER && !defined __clang__
 #define STRUCT_FLD(name, value)	name: value
@@ -146,16 +133,7 @@ i_s_common_deinit(
 
 static ST_FIELD_INFO xtradb_read_view_fields_info[] =
 {
-#define READ_VIEW_UNDO_NUMBER		0
-	{STRUCT_FLD(field_name,		"READ_VIEW_UNDO_NUMBER"),
-	 STRUCT_FLD(field_length,	MY_INT64_NUM_DECIMAL_DIGITS),
-	 STRUCT_FLD(field_type,		MYSQL_TYPE_LONGLONG),
-	 STRUCT_FLD(value,		0),
-	 STRUCT_FLD(field_flags,	MY_I_S_UNSIGNED),
-	 STRUCT_FLD(old_name,		""),
-	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
-
-#define READ_VIEW_LOW_LIMIT_NUMBER	1
+#define READ_VIEW_LOW_LIMIT_NUMBER	0
 	{STRUCT_FLD(field_name,		"READ_VIEW_LOW_LIMIT_TRX_NUMBER"),
 	 STRUCT_FLD(field_length,	TRX_ID_MAX_LEN + 1),
 	 STRUCT_FLD(field_type,		MYSQL_TYPE_STRING),
@@ -164,7 +142,7 @@ static ST_FIELD_INFO xtradb_read_view_fields_info[] =
 	 STRUCT_FLD(old_name,		""),
 	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
 
-#define READ_VIEW_UPPER_LIMIT_ID	2
+#define READ_VIEW_UPPER_LIMIT_ID	1
 	{STRUCT_FLD(field_name,		"READ_VIEW_UPPER_LIMIT_TRX_ID"),
 	 STRUCT_FLD(field_length,	TRX_ID_MAX_LEN + 1),
 	 STRUCT_FLD(field_type,		MYSQL_TYPE_STRING),
@@ -173,7 +151,7 @@ static ST_FIELD_INFO xtradb_read_view_fields_info[] =
 	 STRUCT_FLD(old_name,		""),
 	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
 
-#define READ_VIEW_LOW_LIMIT_ID		3
+#define READ_VIEW_LOW_LIMIT_ID		2
 	{STRUCT_FLD(field_name,		"READ_VIEW_LOW_LIMIT_TRX_ID"),
 
 	 STRUCT_FLD(field_length,	TRX_ID_MAX_LEN + 1),
@@ -188,7 +166,6 @@ static ST_FIELD_INFO xtradb_read_view_fields_info[] =
 
 static int xtradb_read_view_fill_table(THD* thd, TABLE_LIST* tables, Item*)
 {
-	const char*		table_name;
 	Field**	fields;
 	TABLE* table;
 	char		trx_id[TRX_ID_MAX_LEN + 1];
@@ -202,18 +179,13 @@ static int xtradb_read_view_fill_table(THD* thd, TABLE_LIST* tables, Item*)
 		DBUG_RETURN(0);
 	}
 
-	table_name = tables->schema_table_name;
 	table = tables->table;
 	fields = table->field;
-
-	RETURN_IF_INNODB_NOT_STARTED(table_name);
 
 	i_s_xtradb_read_view_t read_view;
 
 	if (read_fill_i_s_xtradb_read_view(&read_view) == NULL)
 		DBUG_RETURN(0);
-
-	OK(field_store_ulint(fields[READ_VIEW_UNDO_NUMBER], read_view.undo_no));
 
 	ut_snprintf(trx_id, sizeof(trx_id), TRX_ID_FMT, read_view.low_limit_no);
 	OK(field_store_string(fields[READ_VIEW_LOW_LIMIT_NUMBER], trx_id));
@@ -249,7 +221,7 @@ static struct st_mysql_information_schema i_s_info =
 	MYSQL_INFORMATION_SCHEMA_INTERFACE_VERSION
 };
 
-UNIV_INTERN struct st_mysql_plugin i_s_xtradb_read_view =
+struct st_mysql_plugin i_s_xtradb_read_view =
 {
 	STRUCT_FLD(type, MYSQL_INFORMATION_SCHEMA_PLUGIN),
 	STRUCT_FLD(info, &i_s_info),
@@ -309,11 +281,8 @@ static ST_FIELD_INFO xtradb_internal_hash_tables_fields_info[] =
 
 static int xtradb_internal_hash_tables_fill_table(THD* thd, TABLE_LIST* tables, Item*)
 {
-	const char*	table_name;
 	Field**		fields;
 	TABLE*		table;
-	ulong		btr_search_sys_constant;
-	ulong		btr_search_sys_variable;
 
 	DBUG_ENTER("xtradb_internal_hash_tables_fill_table");
 
@@ -323,33 +292,16 @@ static int xtradb_internal_hash_tables_fill_table(THD* thd, TABLE_LIST* tables, 
 		DBUG_RETURN(0);
 	}
 
-	table_name = tables->schema_table_name;
 	table = tables->table;
 	fields = table->field;
 
-	RETURN_IF_INNODB_NOT_STARTED(table_name);
-
 	/* Calculate AHI constant and variable memory allocations */
 
-	btr_search_sys_constant = 0;
-	btr_search_sys_variable = 0;
-
-	ut_ad(btr_search_sys->hash_tables);
-
-	for (ulint i = 0; i < btr_search_index_num; i++) {
-		hash_table_t* ht = btr_search_sys->hash_tables[i];
-
-		ut_ad(ht);
-		ut_ad(ht->heap);
-
-		/* Multiple mutexes/heaps are currently never used for adaptive
-		hash index tables. */
-		ut_ad(!ht->n_sync_obj);
-		ut_ad(!ht->heaps);
-
-		btr_search_sys_variable += mem_heap_get_size(ht->heap);
-		btr_search_sys_constant += ht->n_cells * sizeof(hash_cell_t);
-	}
+	ulong btr_search_sys_constant = btr_search_sys_constant_mem;
+	os_rmb;
+	ulong btr_search_sys_variable = btr_search_sys_variable_mem;
+	size_t dict_sys_hash_size = dict_sys->hash_size;
+	ulong dict_sys_size = dict_sys->size;
 
 	OK(field_store_string(fields[INT_HASH_TABLES_NAME],
 			      "Adaptive hash index"));
@@ -373,23 +325,15 @@ static int xtradb_internal_hash_tables_fill_table(THD* thd, TABLE_LIST* tables, 
 
 	}
 
-	if (dict_sys)
-	{
-	  OK(field_store_string(fields[INT_HASH_TABLES_NAME],
-				"Dictionary Cache"));
-	  OK(field_store_ulint(fields[INT_HASH_TABLES_TOTAL],
-			       ((dict_sys->table_hash->n_cells
-				 + dict_sys->table_id_hash->n_cells
-				 ) * sizeof(hash_cell_t)
-				+ dict_sys->size)));
-	  OK(field_store_ulint(fields[INT_HASH_TABLES_CONSTANT],
-			       ((dict_sys->table_hash->n_cells
-				 + dict_sys->table_id_hash->n_cells
-				 ) * sizeof(hash_cell_t))));
-	  OK(field_store_ulint(fields[INT_HASH_TABLES_VARIABLE],
-			       dict_sys->size));
-	  OK(schema_table_store_record(thd, table));
-	}
+	OK(field_store_string(fields[INT_HASH_TABLES_NAME],
+			      "Dictionary Cache"));
+	OK(field_store_ulint(fields[INT_HASH_TABLES_TOTAL],
+			     dict_sys_hash_size + dict_sys_size));
+	OK(field_store_ulint(fields[INT_HASH_TABLES_CONSTANT],
+			     dict_sys_hash_size));
+	OK(field_store_ulint(fields[INT_HASH_TABLES_VARIABLE],
+			     dict_sys_size));
+	OK(schema_table_store_record(thd, table));
 
 	{
 	  OK(field_store_string(fields[INT_HASH_TABLES_NAME],
@@ -454,7 +398,7 @@ static int xtradb_internal_hash_tables_init(void* p)
 	DBUG_RETURN(0);
 }
 
-UNIV_INTERN struct st_mysql_plugin i_s_xtradb_internal_hash_tables =
+struct st_mysql_plugin i_s_xtradb_internal_hash_tables =
 {
 	STRUCT_FLD(type, MYSQL_INFORMATION_SCHEMA_PLUGIN),
 	STRUCT_FLD(info, &i_s_info),
@@ -492,9 +436,25 @@ static ST_FIELD_INFO	i_s_xtradb_rseg_fields_info[] =
 	 STRUCT_FLD(old_name,		""),
 	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
 
-	{STRUCT_FLD(field_name,		"zip_size"),
+	{STRUCT_FLD(field_name,		"physical_page_size"),
 	 STRUCT_FLD(field_length,	MY_INT64_NUM_DECIMAL_DIGITS),
 	 STRUCT_FLD(field_type,		MYSQL_TYPE_LONGLONG),
+	 STRUCT_FLD(value,		0),
+	 STRUCT_FLD(field_flags,	MY_I_S_UNSIGNED),
+	 STRUCT_FLD(old_name,		""),
+	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
+
+	{STRUCT_FLD(field_name,		"logical_page_size"),
+	 STRUCT_FLD(field_length,	MY_INT64_NUM_DECIMAL_DIGITS),
+	 STRUCT_FLD(field_type,		MYSQL_TYPE_LONGLONG),
+	 STRUCT_FLD(value,		0),
+	 STRUCT_FLD(field_flags,	MY_I_S_UNSIGNED),
+	 STRUCT_FLD(old_name,		""),
+	 STRUCT_FLD(open_method,	SKIP_OPEN_TABLE)},
+
+	{STRUCT_FLD(field_name,		"is_compressed"),
+	 STRUCT_FLD(field_length,	1),
+	 STRUCT_FLD(field_type,		MYSQL_TYPE_TINY),
 	 STRUCT_FLD(value,		0),
 	 STRUCT_FLD(field_flags,	MY_I_S_UNSIGNED),
 	 STRUCT_FLD(old_name,		""),
@@ -547,8 +507,6 @@ i_s_xtradb_rseg_fill(
 		DBUG_RETURN(0);
 	}
 
-	RETURN_IF_INNODB_NOT_STARTED(tables->schema_table_name);
-
 	for(int i=0; i < TRX_SYS_N_RSEGS; i++)
 	{
 	  rseg = trx_sys->rseg_array[i];
@@ -557,10 +515,12 @@ i_s_xtradb_rseg_fill(
 
 	  table->field[0]->store(rseg->id);
 	  table->field[1]->store(rseg->space);
-	  table->field[2]->store(rseg->zip_size);
-	  table->field[3]->store(rseg->page_no);
-	  table->field[4]->store(rseg->max_size);
-	  table->field[5]->store(rseg->curr_size);
+	  table->field[2]->store(rseg->page_size.physical());
+	  table->field[3]->store(rseg->page_size.logical());
+	  table->field[4]->store(rseg->page_size.is_compressed());
+	  table->field[5]->store(rseg->page_no);
+	  table->field[6]->store(rseg->max_size);
+	  table->field[7]->store(rseg->curr_size);
 
 	  if (schema_table_store_record(thd, table)) {
 	    status = 1;
@@ -587,7 +547,7 @@ i_s_xtradb_rseg_init(
 	DBUG_RETURN(0);
 }
 
-UNIV_INTERN struct st_mysql_plugin	i_s_xtradb_rseg =
+struct st_mysql_plugin	i_s_xtradb_rseg =
 {
 	STRUCT_FLD(type, MYSQL_INFORMATION_SCHEMA_PLUGIN),
 	STRUCT_FLD(info, &i_s_info),
