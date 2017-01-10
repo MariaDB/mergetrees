@@ -3382,6 +3382,11 @@ innobase_encryption_key_rotation()
 	byte*	master_key = NULL;
 	bool	ret = FALSE;
 
+	if (srv_read_only_mode) {
+		my_error(ER_INNODB_READ_ONLY, MYF(0));
+		return(true);
+	}
+
 	/* Require the mutex to block other rotate request. */
 	mutex_enter(&master_key_id_mutex);
 
@@ -8275,7 +8280,10 @@ ha_innobase::delete_all_rows()
 	if (!dict_table_is_intrinsic(m_prebuilt->table)
 	    && trx_in_innodb.is_aborted()) {
 
-		DBUG_RETURN(innobase_rollback(ht, m_user_thd, false));
+		innobase_rollback(ht, m_user_thd, false);
+
+		DBUG_RETURN(convert_error_code_to_mysql(
+			DB_FORCED_ABORT, 0, m_user_thd));
 	}
 
 	dberr_t	error = row_delete_all_rows(m_prebuilt->table);
@@ -9086,14 +9094,7 @@ ha_innobase::rnd_init(
 	bool	scan)	/*!< in: true if table/index scan FALSE otherwise */
 {
 	TrxInInnoDB	trx_in_innodb(m_prebuilt->trx);
-
-	if (!dict_table_is_intrinsic(m_prebuilt->table)
-	    && trx_in_innodb.is_aborted()) {
-
-		return(innobase_rollback(ht, m_user_thd, false));
-	}
-
-	int	err;
+	int		err;
 
 	/* Store the active index value so that we can restore the original
 	value after a scan */
@@ -11189,7 +11190,8 @@ create_table_info_t::innobase_table_flags()
 		}
 
 		if (m_use_shared_space
-		    || (m_create_info->options & HA_LEX_CREATE_TMP_TABLE)) {
+		    || (m_create_info->options & HA_LEX_CREATE_TMP_TABLE)
+		    || !m_use_file_per_table) {
 			if (!Encryption::is_none(encryption)) {
 				/* Can't encrypt shared tablespace */
 				my_error(ER_TABLESPACE_CANNOT_ENCRYPT, MYF(0));
@@ -14751,6 +14753,28 @@ get_foreign_key_info(
 		thd, f_key_info.update_method, ptr,
 		static_cast<unsigned int>(len), 1);
 
+	/* Load referenced table to update FK referenced key name. */
+	if (foreign->referenced_table == NULL) {
+
+		dict_table_t*	ref_table;
+
+		ut_ad(mutex_own(&dict_sys->mutex));
+		ref_table = dict_table_open_on_name(
+			foreign->referenced_table_name_lookup,
+			TRUE, FALSE, DICT_ERR_IGNORE_NONE);
+
+		if (ref_table == NULL) {
+
+			ib::info() << "Foreign Key referenced table "
+				   << foreign->referenced_table_name
+				   << " not found for foreign table "
+				   << foreign->foreign_table_name;
+		} else {
+
+			dict_table_close(ref_table, TRUE, FALSE);
+		}
+	}
+
 	if (foreign->referenced_index
 	    && foreign->referenced_index->name != NULL) {
 		referenced_key_name = thd_make_lex_string(
@@ -16505,6 +16529,37 @@ ha_innobase::get_auto_increment(
 	ulonglong	col_max_value =
 		table->next_number_field->get_max_int_value();
 
+	/** The following logic is needed to avoid duplicate key error
+	for autoincrement column.
+
+	(1) InnoDB gives the current autoincrement value with respect
+	to increment and offset value.
+
+	(2) Basically it does compute_next_insert_id() logic inside InnoDB
+	to avoid the current auto increment value changed by handler layer.
+
+	(3) It is restricted only for insert operations. */
+
+	if (increment > 1 && thd_sql_command(m_user_thd) != SQLCOM_ALTER_TABLE
+	    && autoinc < col_max_value) {
+
+		ulonglong	prev_auto_inc = autoinc;
+
+		autoinc = ((autoinc - 1) + increment - offset)/ increment;
+
+		autoinc = autoinc * increment + offset;
+
+		/* If autoinc exceeds the col_max_value then reset
+		to old autoinc value. Because in case of non-strict
+		sql mode, boundary value is not considered as error. */
+
+		if (autoinc >= col_max_value) {
+			autoinc = prev_auto_inc;
+		}
+
+		ut_ad(autoinc > 0);
+	}
+
 	/* Called for the first time ? */
 	if (trx->n_autoinc_rows == 0) {
 
@@ -16859,7 +16914,8 @@ innobase_xa_prepare(
 
 	TrxInInnoDB	trx_in_innodb(trx);
 
-	if (trx_in_innodb.is_aborted()) {
+	if (trx_in_innodb.is_aborted() ||
+	    DBUG_EVALUATE_IF("simulate_xa_failure_prepare_in_engine", 1, 0)) {
 
 		innobase_rollback(hton, thd, prepare_trx);
 
@@ -17575,6 +17631,50 @@ innodb_internal_table_validate(
 	}
 
 	return(ret);
+}
+
+/****************************************************************//**
+Update global variable "fts_internal_tbl_name" with the "saved"
+stopword table name value. This function is registered as a callback
+with MySQL. */
+static
+void
+innodb_internal_table_update(
+/*=========================*/
+	THD*				thd,	/*!< in: thread handle */
+	struct st_mysql_sys_var*	var,	/*!< in: pointer to
+						system variable */
+	void*				var_ptr,/*!< out: where the
+						formal string goes */
+	const void*			save)	/*!< in: immediate result
+						from check function */
+{
+	const char*	table_name;
+	char*		old;
+
+	ut_a(save != NULL);
+	ut_a(var_ptr != NULL);
+
+	table_name = *static_cast<const char*const*>(save);
+	old = *(char**) var_ptr;
+
+	if (table_name) {
+		*(char**) var_ptr =  my_strdup(PSI_INSTRUMENT_ME,
+					       table_name,  MYF(0));
+	} else {
+		*(char**) var_ptr = NULL;
+	}
+
+	if (old) {
+		my_free(old);
+	}
+
+	fts_internal_tbl_name2 = *(char**) var_ptr;
+	if (fts_internal_tbl_name2 == NULL) {
+		fts_internal_tbl_name = const_cast<char*>("default");
+	} else {
+		fts_internal_tbl_name = fts_internal_tbl_name2;
+	}
 }
 
 /****************************************************************//**
@@ -19077,6 +19177,12 @@ static MYSQL_SYSVAR_BOOL(doublewrite, innobase_use_doublewrite,
   " Disable with --skip-innodb-doublewrite.",
   NULL, NULL, TRUE);
 
+static MYSQL_SYSVAR_BOOL(stats_include_delete_marked,
+  srv_stats_include_delete_marked,
+  PLUGIN_VAR_OPCMDARG,
+  "Include delete marked records when calculating persistent statistics",
+  NULL, NULL, FALSE);
+
 static MYSQL_SYSVAR_ULONG(io_capacity, srv_io_capacity,
   PLUGIN_VAR_RQCMDARG,
   "Number of IOPs the server can do. Tunes the background IO rate",
@@ -19493,6 +19599,13 @@ static MYSQL_SYSVAR_ULONG(concurrency_tickets, srv_n_free_tickets_to_enter,
   "Number of times a thread is allowed to enter InnoDB within the same SQL query after it has once got the ticket",
   NULL, NULL, 5000L, 1L, ~0UL, 0);
 
+static MYSQL_SYSVAR_BOOL(deadlock_detect, innobase_deadlock_detect,
+  PLUGIN_VAR_NOCMDARG,
+  "Enable/disable InnoDB deadlock detector (default ON)."
+  " if set to OFF, deadlock detection is skipped,"
+  " and we rely on innodb_lock_wait_timeout in case of deadlock.",
+  NULL, NULL, TRUE);
+
 static MYSQL_SYSVAR_LONG(fill_factor, innobase_fill_factor,
   PLUGIN_VAR_RQCMDARG,
   "Percentage of B-tree page filled during bulk insert",
@@ -19508,11 +19621,11 @@ static MYSQL_SYSVAR_BOOL(disable_sort_file_cache, srv_disable_sort_file_cache,
   "Whether to disable OS system file cache for sort I/O",
   NULL, NULL, FALSE);
 
-static MYSQL_SYSVAR_STR(ft_aux_table, fts_internal_tbl_name,
-  PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_MEMALLOC,
+static MYSQL_SYSVAR_STR(ft_aux_table, fts_internal_tbl_name2,
+  PLUGIN_VAR_NOCMDARG,
   "FTS internal auxiliary table to be checked",
   innodb_internal_table_validate,
-  NULL, NULL);
+  innodb_internal_table_update, NULL);
 
 static MYSQL_SYSVAR_ULONG(ft_cache_size, fts_max_cache_size,
   PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
@@ -19745,12 +19858,12 @@ static MYSQL_SYSVAR_BOOL(use_native_aio, srv_use_native_aio,
   "Use native AIO if supported on this platform.",
   NULL, NULL, TRUE);
 
-#if defined(HAVE_LIBNUMA) && defined(WITH_NUMA)
+#ifdef HAVE_LIBNUMA
 static MYSQL_SYSVAR_BOOL(numa_interleave, srv_numa_interleave,
   PLUGIN_VAR_NOCMDARG | PLUGIN_VAR_READONLY,
   "Use NUMA interleave memory policy to allocate InnoDB buffer pool.",
   NULL, NULL, FALSE);
-#endif /* HAVE_LIBNUMA && WITH_NUMA */
+#endif /* HAVE_LIBNUMA */
 
 static MYSQL_SYSVAR_BOOL(api_enable_binlog, ib_binlog_enabled,
   PLUGIN_VAR_NOCMDARG | PLUGIN_VAR_READONLY,
@@ -19990,6 +20103,7 @@ static struct st_mysql_sys_var* innobase_system_variables[]= {
   MYSQL_SYSVAR(temp_data_file_path),
   MYSQL_SYSVAR(data_home_dir),
   MYSQL_SYSVAR(doublewrite),
+  MYSQL_SYSVAR(stats_include_delete_marked),
   MYSQL_SYSVAR(api_enable_binlog),
   MYSQL_SYSVAR(api_enable_mdl),
   MYSQL_SYSVAR(api_disable_rowlock),
@@ -20020,6 +20134,7 @@ static struct st_mysql_sys_var* innobase_system_variables[]= {
   MYSQL_SYSVAR(force_load_corrupted),
   MYSQL_SYSVAR(locks_unsafe_for_binlog),
   MYSQL_SYSVAR(lock_wait_timeout),
+  MYSQL_SYSVAR(deadlock_detect),
   MYSQL_SYSVAR(page_size),
   MYSQL_SYSVAR(log_buffer_size),
   MYSQL_SYSVAR(log_file_size),
@@ -20070,9 +20185,9 @@ static struct st_mysql_sys_var* innobase_system_variables[]= {
   MYSQL_SYSVAR(autoinc_lock_mode),
   MYSQL_SYSVAR(version),
   MYSQL_SYSVAR(use_native_aio),
-#if defined(HAVE_LIBNUMA) && defined(WITH_NUMA)
+#ifdef HAVE_LIBNUMA
   MYSQL_SYSVAR(numa_interleave),
-#endif /* HAVE_LIBNUMA && WITH_NUMA */
+#endif /* HAVE_LIBNUMA */
   MYSQL_SYSVAR(change_buffering),
   MYSQL_SYSVAR(change_buffer_max_size),
 #if defined UNIV_DEBUG || defined UNIV_IBUF_DEBUG
