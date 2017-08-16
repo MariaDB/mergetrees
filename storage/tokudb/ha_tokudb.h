@@ -710,7 +710,7 @@ private:
     int is_index_unique(bool* is_unique, DB_TXN* txn, DB* db, KEY* key_info, int lock_flags);
     int is_val_unique(bool* is_unique, uchar* record, KEY* key_info, uint dict_index, DB_TXN* txn);
     int do_uniqueness_checks(uchar* record, DB_TXN* txn, THD* thd);
-    void set_main_dict_put_flags(THD* thd, bool opt_eligible, uint32_t* put_flags);
+    void set_main_dict_put_flags(THD* thd, uint32_t* put_flags);
     int insert_row_to_main_dictionary(uchar* record, DBT* pk_key, DBT* pk_val, DB_TXN* txn);
     int insert_rows_to_dictionaries_mult(DBT* pk_key, DBT* pk_val, DB_TXN* txn, THD* thd);
     void test_row_packing(uchar* record, DBT* pk_key, DBT* pk_val);
@@ -799,6 +799,19 @@ public:
 #else
     void start_bulk_insert(ha_rows rows);
 #endif
+    static int bulk_insert_poll(void* extra, float progress);
+    static void loader_add_index_err(DB* db,
+                                     int i,
+                                     int err,
+                                     DBT* key,
+                                     DBT* val,
+                                     void* error_extra);
+    static void loader_dup(DB* db,
+                           int i,
+                           int err,
+                           DBT* key,
+                           DBT* val,
+                           void* error_extra);
     int end_bulk_insert();
     int end_bulk_insert(bool abort);
 
@@ -861,7 +874,7 @@ public:
     uint8 table_cache_type() {
         return HA_CACHE_TBL_TRANSACT;
     }
-    bool primary_key_is_clustered() {
+    bool primary_key_is_clustered() const {
         return true;
     }
     int cmp_ref(const uchar * ref1, const uchar * ref2);
@@ -938,17 +951,23 @@ public:
 #endif
 
  private:
-    int tokudb_add_index(
-        TABLE *table_arg, 
-        KEY *key_info, 
-        uint num_of_keys, 
-        DB_TXN* txn, 
-        bool* inc_num_DBs,
-        bool* modified_DB
-        ); 
-    void restore_add_index(TABLE* table_arg, uint num_of_keys, bool incremented_numDBs, bool modified_DBs);
-    int drop_indexes(TABLE *table_arg, uint *key_num, uint num_of_keys, KEY *key_info, DB_TXN* txn);
-    void restore_drop_indexes(TABLE *table_arg, uint *key_num, uint num_of_keys);
+  int tokudb_add_index(TABLE* table_arg,
+                       KEY* key_info,
+                       uint num_of_keys,
+                       DB_TXN* txn,
+                       bool* inc_num_DBs,
+                       bool* modified_DB);
+  static int tokudb_add_index_poll(void *extra, float progress);
+  void restore_add_index(TABLE* table_arg,
+                         uint num_of_keys,
+                         bool incremented_numDBs,
+                         bool modified_DBs);
+  int drop_indexes(TABLE* table_arg,
+                   uint* key_num,
+                   uint num_of_keys,
+                   KEY* key_info,
+                   DB_TXN* txn);
+  void restore_drop_indexes(TABLE* table_arg, uint* key_num, uint num_of_keys);
 
  public:
     // delete all rows from the table

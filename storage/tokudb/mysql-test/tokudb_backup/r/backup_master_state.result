@@ -18,7 +18,7 @@ filename: ####, position: ####, gtid_mode: OFF, GTID of last change:
 ### Delete backup dir
 ### Create backup dir
 ### GTID-mode on
-include/rpl_set_gtid_mode.inc
+include/rpl_set_gtid_mode.inc [ON on servers 1,2]
 ### Check for settings
 SELECT @@gtid_mode;
 @@gtid_mode
@@ -32,5 +32,5 @@ include/filter_file.inc
 filename: ####, position: ####, gtid_mode: ON, GTID of last change: #####
 ### Delete backup dir
 ### GTID-mode off
-include/rpl_set_gtid_mode.inc
+include/rpl_set_gtid_mode.inc [OFF on servers 1,2]
 include/rpl_end.inc

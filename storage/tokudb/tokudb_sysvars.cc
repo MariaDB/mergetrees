@@ -28,6 +28,7 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 #include "sql_acl.h"
 #include "tokudb_dir_cmd.h"
 #include "sql_parse.h"
+#include "sql_plugin.h"
 
 namespace tokudb {
 namespace sysvars {
@@ -71,7 +72,7 @@ uint        read_status_frequency = 0;
 my_bool     strip_frm_data = FALSE;
 char*       tmp_dir = NULL;
 uint        write_status_frequency = 0;
-my_bool     dir_per_db = FALSE;
+my_bool     dir_per_db = TRUE;
 char*       version = (char*) TOKUDB_VERSION_STR;
 
 // file system reserve as a percentage of total disk space
@@ -113,7 +114,7 @@ static MYSQL_SYSVAR_INT(
     "index cardinality scale percentage",
     NULL,
     NULL,
-    50,
+    100,
     0,
     100,
     0);
@@ -410,7 +411,7 @@ static void tokudb_dir_per_db_update(THD* thd,
 
 static MYSQL_SYSVAR_BOOL(dir_per_db, dir_per_db,
     0, "TokuDB store ft files in db directories",
-    NULL, tokudb_dir_per_db_update, FALSE);
+    NULL, tokudb_dir_per_db_update, TRUE);
 
 #if TOKU_INCLUDE_HANDLERTON_HANDLE_FATAL_SIGNAL
 static MYSQL_SYSVAR_STR(
@@ -470,7 +471,7 @@ static MYSQL_THDVAR_BOOL(
     "dispatch ANALYZE TABLE to background job.",
     NULL,
     NULL,
-    false);
+    true);
 
 const char* srv_analyze_mode_names[] = {
     "TOKUDB_ANALYZE_STANDARD",
@@ -526,7 +527,7 @@ static MYSQL_THDVAR_ULONGLONG(
     "auto analyze threshold (percent)",
     NULL,
     NULL,
-    0,
+    30,
     0,
     ~0U,
     1);
@@ -745,50 +746,6 @@ static MYSQL_THDVAR_ULONGLONG(
     ~0ULL,
     1);
 
-static const char* deprecated_tokudb_pk_insert_mode =
-    "Using tokudb_pk_insert_mode is deprecated and the "
-    "parameter may be removed in future releases.";
-static const char* deprecated_tokudb_pk_insert_mode_zero =
-    "Using tokudb_pk_insert_mode=0 is deprecated and the "
-    "parameter may be removed in future releases. "
-    "Only tokudb_pk_insert_mode=1|2 is allowed."
-    "Resettig the value to 1.";
-
-static void pk_insert_mode_update(
-    THD* thd,
-    st_mysql_sys_var* var,
-    void* var_ptr,
-    const void* save) {
-    const uint* new_pk_insert_mode = static_cast<const uint*>(save);
-    uint* pk_insert_mode = static_cast<uint*>(var_ptr);
-    if (*new_pk_insert_mode == 0) {
-        push_warning(
-            thd,
-            Sql_condition::WARN_LEVEL_WARN,
-            HA_ERR_WRONG_COMMAND,
-            deprecated_tokudb_pk_insert_mode_zero);
-        *pk_insert_mode = 1;
-    } else {
-        push_warning(
-            thd,
-            Sql_condition::WARN_LEVEL_WARN,
-            HA_ERR_WRONG_COMMAND,
-            deprecated_tokudb_pk_insert_mode);
-        *pk_insert_mode = *new_pk_insert_mode;
-    }
-}
-
-static MYSQL_THDVAR_UINT(
-    pk_insert_mode,
-    0,
-    "set the primary key insert mode",
-    NULL,
-    pk_insert_mode_update,
-    1,
-    0,
-    2,
-    1);
-
 static MYSQL_THDVAR_BOOL(
     prelock_empty,
     0,
@@ -913,15 +870,34 @@ static MYSQL_THDVAR_BOOL(
     false);
 #endif
 
-#if TOKU_INCLUDE_XA
+static const char* deprecated_tokudb_support_xa =
+    "Using tokudb_support_xa is deprecated and the "
+    "parameter may be removed in future releases.";
+static const char* deprecated_tokudb_support_xa_off =
+    "Using tokudb_support_xa is deprecated and the "
+    "parameter may be removed in future releases. "
+    "Only tokudb_support_xa=ON is allowed.";
+
+static void support_xa_update(
+    THD* thd,
+    st_mysql_sys_var* var,
+    void* var_ptr,
+    const void* save) {
+    my_bool tokudb_support_xa = *static_cast<const my_bool*>(save);
+    push_warning(thd,
+                 Sql_condition::SL_WARNING,
+                 HA_ERR_WRONG_COMMAND,
+                 tokudb_support_xa ? deprecated_tokudb_support_xa :
+                 deprecated_tokudb_support_xa_off);
+}
+
 static MYSQL_THDVAR_BOOL(
     support_xa,
     PLUGIN_VAR_OPCMDARG,
     "Enable TokuDB support for the XA two-phase commit",
     NULL,
-    NULL,
+    support_xa_update,
     true);
-#endif
 
 static int dir_cmd_check(THD* thd, struct st_mysql_sys_var* var,
                          void* save, struct st_mysql_value* value) ;
@@ -1052,7 +1028,6 @@ st_mysql_sys_var* system_variables[] = {
     MYSQL_SYSVAR(optimize_index_fraction),
     MYSQL_SYSVAR(optimize_index_name),
     MYSQL_SYSVAR(optimize_throttle),
-    MYSQL_SYSVAR(pk_insert_mode),
     MYSQL_SYSVAR(prelock_empty),
     MYSQL_SYSVAR(read_block_size),
     MYSQL_SYSVAR(read_buf_size),
@@ -1068,9 +1043,7 @@ st_mysql_sys_var* system_variables[] = {
     MYSQL_SYSVAR(disable_slow_upsert),
 #endif
 
-#if TOKU_INCLUDE_XA
     MYSQL_SYSVAR(support_xa),
-#endif
 
 #if TOKUDB_DEBUG
    MYSQL_SYSVAR(debug_pause_background_job_manager),
@@ -1124,12 +1097,14 @@ my_bool disable_prefetching(THD* thd) {
 my_bool disable_slow_alter(THD* thd) {
     return (THDVAR(thd, disable_slow_alter) != 0);
 }
+#if TOKU_INCLUDE_UPSERT
 my_bool disable_slow_update(THD* thd) {
     return (THDVAR(thd, disable_slow_update) != 0);
 }
 my_bool disable_slow_upsert(THD* thd) {
     return (THDVAR(thd, disable_slow_upsert) != 0);
 }
+#endif
 empty_scan_mode_t empty_scan(THD* thd) {
     return (empty_scan_mode_t)THDVAR(thd, empty_scan);
 }
@@ -1169,12 +1144,6 @@ const char* optimize_index_name(THD* thd) {
 ulonglong optimize_throttle(THD* thd) {
     return THDVAR(thd, optimize_throttle);
 }
-uint pk_insert_mode(THD* thd) {
-    return THDVAR(thd, pk_insert_mode);
-}
-void set_pk_insert_mode(THD* thd, uint mode) {
-    THDVAR(thd, pk_insert_mode) = mode;
-}
 my_bool prelock_empty(THD* thd) {
     return (THDVAR(thd, prelock_empty) != 0);
 }
@@ -1205,6 +1174,8 @@ ulonglong rpl_unique_checks_delay(THD* thd) {
 my_bool support_xa(THD* thd) {
     return (THDVAR(thd, support_xa) != 0);
 }
-
+void set_support_xa(THD* thd, my_bool xa) {
+    THDVAR(thd, support_xa) = xa;
+}
 } // namespace sysvars
 } // namespace tokudb

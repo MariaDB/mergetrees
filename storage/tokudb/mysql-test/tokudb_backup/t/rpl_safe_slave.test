@@ -1,4 +1,5 @@
 --source include/have_tokudb_backup.inc
+--source include/not_group_replication_plugin.inc
 --source include/have_binlog_format_statement.inc
 --source include/have_debug_sync.inc
 
@@ -47,3 +48,17 @@ CALL mtr.add_suppression("Sending passwords in plain text without SSL/TLS is ext
 --source rpl_safe_slave.inc
 
 --source include/rpl_end.inc
+
+--echo ###
+--echo # test for multisource replication with binlog
+--echo ####
+
+--let $rpl_topology= 1->2, 3->2
+--let $rpl_multi_source=1
+--source include/rpl_init.inc
+
+--source rpl_safe_slave.inc
+
+--let $rpl_skip_sync= 1
+--source include/rpl_end.inc
+

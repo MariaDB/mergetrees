@@ -111,8 +111,10 @@ my_bool     create_index_online(THD* thd);
 my_bool     disable_hot_alter(THD* thd);
 my_bool     disable_prefetching(THD* thd);
 my_bool     disable_slow_alter(THD* thd);
+#if TOKU_INCLUDE_UPSERT
 my_bool     disable_slow_update(THD* thd);
 my_bool     disable_slow_upsert(THD* thd);
+#endif
 empty_scan_mode_t empty_scan(THD* thd);
 uint        fanout(THD* thd);
 my_bool     hide_default_row_format(THD* thd);
@@ -126,7 +128,6 @@ uint        lock_timeout_debug(THD* thd);
 double      optimize_index_fraction(THD* thd);
 const char* optimize_index_name(THD* thd);
 ulonglong   optimize_throttle(THD* thd);
-uint        pk_insert_mode(THD* thd);
 void        set_pk_insert_mode(THD* thd, uint mode);
 my_bool     prelock_empty(THD* thd);
 uint        read_block_size(THD* thd);
@@ -138,6 +139,7 @@ ulonglong   rpl_lookup_rows_delay(THD* thd);
 my_bool     rpl_unique_checks(THD* thd);
 ulonglong   rpl_unique_checks_delay(THD* thd);
 my_bool     support_xa(THD* thd);
+void        set_support_xa(THD* thd, my_bool xa);
 
 extern st_mysql_sys_var* system_variables[];
 

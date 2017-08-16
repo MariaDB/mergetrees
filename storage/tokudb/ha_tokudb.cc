@@ -157,7 +157,8 @@ void TOKUDB_SHARE::static_init() {
         0,
         0,
         (my_hash_get_key)hash_get_key,
-        (my_hash_free_key)hash_free_element, 0);
+        (my_hash_free_key)hash_free_element, 0,
+        0); // TODO: instrument for PFS
 }
 void TOKUDB_SHARE::static_destroy() {
     my_hash_free(&_open_tables);
@@ -368,7 +369,7 @@ void TOKUDB_SHARE::update_row_count(
     if (delta && auto_threshold > 0 && _allow_auto_analysis) {
         ulonglong pct_of_rows_changed_to_trigger;
         pct_of_rows_changed_to_trigger = ((_rows * auto_threshold) / 100);
-        if (_row_delta_activity >= pct_of_rows_changed_to_trigger) {
+        if (TOKUDB_UNLIKELY(_row_delta_activity >= pct_of_rows_changed_to_trigger)) {
             char msg[200];
             snprintf(msg,
                      sizeof(msg),
@@ -384,9 +385,9 @@ void TOKUDB_SHARE::update_row_count(
 
             // analyze_standard will unlock _mutex regardless of success/failure
             int ret = analyze_standard(thd, NULL);
-            if (ret == 0) {
+            if (TOKUDB_UNLIKELY(ret == 0 && tokudb::sysvars::debug > 0)) {
                 sql_print_information("%s - succeeded.", msg);
-            } else {
+            } else if (TOKUDB_UNLIKELY(ret != 0)) {
                 sql_print_information(
                     "%s - failed, likely a job already running.",
                     msg);
@@ -403,10 +404,16 @@ void TOKUDB_SHARE::set_cardinality_counts_in_table(TABLE* table) {
         bool is_unique_key =
             (i == table->s->primary_key) || (key->flags & HA_NOSAME);
 
+        /* Check if this index supports index statistics. */
+        if (!key->supports_records_per_key()) {
+            continue;
+        }
+
         for (uint32_t j = 0; j < key->actual_key_parts; j++) {
             if (j >= key->user_defined_key_parts) {
                 // MySQL 'hidden' keys, really needs deeper investigation
                 // into MySQL hidden keys vs TokuDB hidden keys
+                key->set_records_per_key(j, 1.0);
                 key->rec_per_key[j] = 1;
                 continue;
             }
@@ -418,6 +425,9 @@ void TOKUDB_SHARE::set_cardinality_counts_in_table(TABLE* table) {
                 (is_unique_key && j == key->actual_key_parts - 1)) {
                 val = 1;
             }
+            key->set_records_per_key(
+                j,
+                static_cast<rec_per_key_t>(val));
             key->rec_per_key[j] = val;
         }
     }
@@ -450,7 +460,7 @@ static inline bool is_insert_ignore (THD* thd) {
     //
     // from http://lists.mysql.com/internals/37735
     //
-    return thd->lex->ignore && thd->lex->duplicates == DUP_ERROR;
+    return thd->lex->is_ignore() && thd->lex->duplicates == DUP_ERROR;
 }
 
 static inline bool is_replace_into(THD* thd) {
@@ -465,12 +475,12 @@ static inline bool do_ignore_flag_optimization(
     bool do_opt = false;
     if (opt_eligible &&
         (is_replace_into(thd) || is_insert_ignore(thd)) &&
-        tokudb::sysvars::pk_insert_mode(thd) == 1 &&
         !table->triggers &&
         !(mysql_bin_log.is_open() &&
          thd->variables.binlog_format != BINLOG_FORMAT_STMT)) {
         do_opt = true;
     }
+
     return do_opt;
 }
 
@@ -531,51 +541,6 @@ typedef struct index_read_info {
     int cmp;
     DBT* orig_key;
 } *INDEX_READ_INFO;
-
-static int ai_poll_fun(void *extra, float progress) {
-    LOADER_CONTEXT context = (LOADER_CONTEXT)extra;
-    if (thd_killed(context->thd)) {
-        sprintf(context->write_status_msg, "The process has been killed, aborting add index.");
-        return ER_ABORTING_CONNECTION;
-    }
-    float percentage = progress * 100;
-    sprintf(context->write_status_msg, "Adding of indexes about %.1f%% done", percentage);
-    thd_proc_info(context->thd, context->write_status_msg);
-#ifdef HA_TOKUDB_HAS_THD_PROGRESS
-    thd_progress_report(context->thd, (unsigned long long) percentage, 100);
-#endif
-    return 0;
-}
-
-static int loader_poll_fun(void *extra, float progress) {
-    LOADER_CONTEXT context = (LOADER_CONTEXT)extra;
-    if (thd_killed(context->thd)) {
-        sprintf(context->write_status_msg, "The process has been killed, aborting bulk load.");
-        return ER_ABORTING_CONNECTION;
-    }
-    float percentage = progress * 100;
-    sprintf(context->write_status_msg, "Loading of data about %.1f%% done", percentage);
-    thd_proc_info(context->thd, context->write_status_msg);
-#ifdef HA_TOKUDB_HAS_THD_PROGRESS
-    thd_progress_report(context->thd, (unsigned long long) percentage, 100);
-#endif
-    return 0;
-}
-
-static void loader_ai_err_fun(DB *db, int i, int err, DBT *key, DBT *val, void *error_extra) {
-    LOADER_CONTEXT context = (LOADER_CONTEXT)error_extra;
-    assert_always(context->ha);
-    context->ha->set_loader_error(err);
-}
-
-static void loader_dup_fun(DB *db, int i, int err, DBT *key, DBT *val, void *error_extra) {
-    LOADER_CONTEXT context = (LOADER_CONTEXT)error_extra;
-    assert_always(context->ha);
-    context->ha->set_loader_error(err);
-    if (err == DB_KEYEXIST) {
-        context->ha->set_dup_value_for_pk(key);
-    }
-}
 
 //
 // smart DBT callback function for optimize
@@ -738,13 +703,13 @@ static ulonglong retrieve_auto_increment(uint16 type, uint32 offset,const uchar 
     /* The remaining two cases should not be used but are included for 
        compatibility */
     case HA_KEYTYPE_FLOAT:                      
-        float4get(float_tmp, key);  /* Note: float4get is a macro */
+        float4get(&float_tmp, key);  /* Note: float4get is a macro */
         signed_autoinc   = (longlong) float_tmp;
         autoinc_type     = signed_type;
         break;
 
     case HA_KEYTYPE_DOUBLE:
-        float8get(double_tmp, key); /* Note: float8get is a macro */
+        float8get(&double_tmp, key); /* Note: float8get is a macro */
         signed_autoinc   = (longlong) double_tmp;
         autoinc_type     = signed_type;
         break;
@@ -1447,14 +1412,14 @@ int ha_tokudb::open_secondary_dictionary(
 
 
     if ((error = db_create(ptr, db_env, 0))) {
-        my_errno = error;
+        set_my_errno(error);
         goto cleanup;
     }
 
 
     error = (*ptr)->open(*ptr, txn, newname, NULL, DB_BTREE, open_flags, 0);
     if (error) {
-        my_errno = error;
+        set_my_errno(error);
         goto cleanup;
     }
     TOKUDB_HANDLER_TRACE_FOR_FLAGS(
@@ -1742,7 +1707,8 @@ int ha_tokudb::initialize_share(const char* name, int mode) {
             table_share->key_info[i].user_defined_key_parts;
         if (i == primary_key) {
             share->_key_descriptors[i]._is_unique = true;
-            share->_key_descriptors[i]._name = tokudb::memory::strdup("primary", 0);
+            share->_key_descriptors[i]._name =
+                tokudb::memory::strdup("primary", 0);
         } else {
             share->_key_descriptors[i]._is_unique = false;
             share->_key_descriptors[i]._name =
@@ -1776,14 +1742,17 @@ int ha_tokudb::initialize_share(const char* name, int mode) {
     if (!hidden_primary_key) {
         //
         // We need to set the ref_length to start at 5, to account for
-        // the "infinity byte" in keys, and for placing the DBT size in the first four bytes
+        // the "infinity byte" in keys, and for placing the DBT size in the
+        // first four bytes
         //
         ref_length = sizeof(uint32_t) + sizeof(uchar);
         KEY_PART_INFO* key_part = table->key_info[primary_key].key_part;
         KEY_PART_INFO* end =
             key_part + table->key_info[primary_key].user_defined_key_parts;
         for (; key_part != end; key_part++) {
-            ref_length += key_part->field->max_packed_col_length(key_part->length);
+            uint field_length = key_part->field->pack_length();
+            field_length += (field_length > 255 ? 2 : 1);
+            ref_length += field_length;
             TOKU_TYPE toku_type = mysql_to_toku_type(key_part->field);
             if (toku_type == toku_type_fixstring ||
                 toku_type == toku_type_varstring ||
@@ -1994,7 +1963,7 @@ exit:
         rec_update_buff = NULL;
         
         if (error) {
-            my_errno = error;
+            set_my_errno(error);
         }
     }
     TOKUDB_HANDLER_DBUG_RETURN(ret_val);
@@ -2934,7 +2903,13 @@ DBT* ha_tokudb::pack_key(
         inf_byte);
 #if TOKU_INCLUDE_EXTENDED_KEYS
     if (keynr != primary_key && !tokudb_test(hidden_primary_key)) {
-        DBUG_RETURN(pack_ext_key(key, keynr, buff, key_ptr, key_length, inf_byte));
+        DBUG_RETURN(pack_ext_key(
+            key,
+            keynr,
+            buff,
+            key_ptr,
+            key_length,
+            inf_byte));
     }
 #endif
     KEY* key_info = &table->key_info[keynr];
@@ -2942,7 +2917,7 @@ DBT* ha_tokudb::pack_key(
     KEY_PART_INFO* end = key_part + key_info->user_defined_key_parts;
     my_bitmap_map* old_map = dbug_tmp_use_all_columns(table, table->write_set);
 
-    memset((void *) key, 0, sizeof(*key));
+    memset(key, 0, sizeof(*key));
     key->data = buff;
 
     // first put the "infinity" byte at beginning. States if missing columns are implicitly
@@ -2992,8 +2967,8 @@ DBT* ha_tokudb::pack_ext_key(
 
     TOKUDB_HANDLER_DBUG_ENTER("");
 
-    // build a list of PK parts that are in the SK.  we will use this list to build the
-    // extended key if necessary. 
+    // build a list of PK parts that are in the SK.  we will use this list to
+    // build the extended key if necessary.
     KEY* pk_key_info = &table->key_info[primary_key];
     uint pk_parts = pk_key_info->user_defined_key_parts;
     uint pk_next = 0;
@@ -3396,11 +3371,13 @@ void ha_tokudb::start_bulk_insert(ha_rows rows) {
 
                 lc.thd = thd;
                 lc.ha = this;
-                
-                error = loader->set_poll_function(loader, loader_poll_fun, &lc);
+
+                error = loader->set_poll_function(
+                    loader, ha_tokudb::bulk_insert_poll, &lc);
                 assert_always(!error);
 
-                error = loader->set_error_callback(loader, loader_dup_fun, &lc);
+                error = loader->set_error_callback(
+                    loader, ha_tokudb::loader_dup, &lc);
                 assert_always(!error);
 
                 trx->stmt_progress.using_loader = true;
@@ -3412,6 +3389,47 @@ void ha_tokudb::start_bulk_insert(ha_rows rows) {
         share->unlock();
     }
     TOKUDB_HANDLER_DBUG_VOID_RETURN;
+}
+int ha_tokudb::bulk_insert_poll(void* extra, float progress) {
+    LOADER_CONTEXT context = (LOADER_CONTEXT)extra;
+    if (thd_killed(context->thd)) {
+        sprintf(context->write_status_msg,
+                "The process has been killed, aborting bulk load.");
+        return ER_ABORTING_CONNECTION;
+    }
+    float percentage = progress * 100;
+    sprintf(context->write_status_msg,
+            "Loading of data t %s about %.1f%% done",
+            context->ha->share->full_table_name(),
+            percentage);
+    thd_proc_info(context->thd, context->write_status_msg);
+#ifdef HA_TOKUDB_HAS_THD_PROGRESS
+    thd_progress_report(context->thd, (unsigned long long)percentage, 100);
+#endif
+    return 0;
+}
+void ha_tokudb::loader_add_index_err(DB* db,
+                                     int i,
+                                     int err,
+                                     DBT* key,
+                                     DBT* val,
+                                     void* error_extra) {
+    LOADER_CONTEXT context = (LOADER_CONTEXT)error_extra;
+    assert_always(context->ha);
+    context->ha->set_loader_error(err);
+}
+void ha_tokudb::loader_dup(DB* db,
+                           int i,
+                           int err,
+                           DBT* key,
+                           DBT* val,
+                           void* error_extra) {
+    LOADER_CONTEXT context = (LOADER_CONTEXT)error_extra;
+    assert_always(context->ha);
+    context->ha->set_loader_error(err);
+    if (err == DB_KEYEXIST) {
+        context->ha->set_dup_value_for_pk(key);
+    }
 }
 
 //
@@ -3492,7 +3510,7 @@ cleanup:
     abort_loader = false;
     memset(&lc, 0, sizeof(lc));
     if (error || loader_error) {
-        my_errno = error ? error : loader_error;
+        set_my_errno(error ? error : loader_error);
         if (using_loader) {
             share->try_table_lock = true;
         }
@@ -3834,11 +3852,18 @@ void ha_tokudb::test_row_packing(uchar* record, DBT* pk_key, DBT* pk_val) {
 }
 
 // set the put flags for the main dictionary
-void ha_tokudb::set_main_dict_put_flags(THD* thd, bool opt_eligible, uint32_t* put_flags) {
+void ha_tokudb::set_main_dict_put_flags(
+    THD* thd,
+    uint32_t* put_flags) {
+
     uint32_t old_prelock_flags = 0;
     uint curr_num_DBs = table->s->keys + tokudb_test(hidden_primary_key);
     bool in_hot_index = share->num_DBs > curr_num_DBs;
-    bool using_ignore_flag_opt = do_ignore_flag_optimization(thd, table, share->replace_into_fast && !using_ignore_no_key);
+    bool using_ignore_flag_opt =
+        do_ignore_flag_optimization(
+            thd,
+            table,
+            share->replace_into_fast && !using_ignore_no_key);
     //
     // optimization for "REPLACE INTO..." (and "INSERT IGNORE") command
     // if the command is "REPLACE INTO" and the only table
@@ -3850,38 +3875,35 @@ void ha_tokudb::set_main_dict_put_flags(THD* thd, bool opt_eligible, uint32_t* p
     // to do. We cannot do this if otherwise, because then we lose
     // consistency between indexes
     //
-    if (hidden_primary_key) 
-    {
+    if (hidden_primary_key) {
         *put_flags = old_prelock_flags;
-    }
-    else if (!do_unique_checks(thd, in_rpl_write_rows | in_rpl_update_rows) && !is_replace_into(thd) && !is_insert_ignore(thd))
-    {
+    } else if (!do_unique_checks(thd, in_rpl_write_rows | in_rpl_update_rows) &&
+               !is_replace_into(thd) &&
+               !is_insert_ignore(thd)) {
         *put_flags = old_prelock_flags;
-    }
-    else if (using_ignore_flag_opt && is_replace_into(thd) 
-            && !in_hot_index)
-    {
+    } else if (using_ignore_flag_opt && is_replace_into(thd) && !in_hot_index) {
         *put_flags = old_prelock_flags;
-    }
-    else if (opt_eligible && using_ignore_flag_opt && is_insert_ignore(thd) 
-            && !in_hot_index)
-    {
-        *put_flags = DB_NOOVERWRITE_NO_ERROR | old_prelock_flags;
-    }
-    else 
-    {
+    } else {
+        // GL on DB-937 : The server expects an SE to return ER_DUP_ENTRY on a
+        // dup key hit even when IGNORE is in use. This is so the server can
+        // set the correct warnings on the statement.
         *put_flags = DB_NOOVERWRITE | old_prelock_flags;
     }
 }
 
-int ha_tokudb::insert_row_to_main_dictionary(uchar* record, DBT* pk_key, DBT* pk_val, DB_TXN* txn) {
+int ha_tokudb::insert_row_to_main_dictionary(
+    uchar* record,
+    DBT* pk_key,
+    DBT* pk_val,
+    DB_TXN* txn) {
+
     int error = 0;
     uint curr_num_DBs = table->s->keys + tokudb_test(hidden_primary_key);
     assert_always(curr_num_DBs == 1);
 
     uint32_t put_flags = mult_put_flags[primary_key];
     THD *thd = ha_thd(); 
-    set_main_dict_put_flags(thd, true, &put_flags);
+    set_main_dict_put_flags(thd, &put_flags);
 
     // for test, make unique checks have a very long duration
     if ((put_flags & DB_OPFLAGS_MASK) == DB_NOOVERWRITE)
@@ -3897,10 +3919,15 @@ cleanup:
     return error;
 }
 
-int ha_tokudb::insert_rows_to_dictionaries_mult(DBT* pk_key, DBT* pk_val, DB_TXN* txn, THD* thd) {
+int ha_tokudb::insert_rows_to_dictionaries_mult(
+    DBT* pk_key,
+    DBT* pk_val,
+    DB_TXN* txn,
+    THD* thd) {
+
     int error = 0;
     uint curr_num_DBs = share->num_DBs;
-    set_main_dict_put_flags(thd, true, &mult_put_flags[primary_key]);
+    set_main_dict_put_flags(thd, &mult_put_flags[primary_key]);
     uint32_t flags = mult_put_flags[primary_key];
 
     // for test, make unique checks have a very long duration
@@ -3924,14 +3951,24 @@ int ha_tokudb::insert_rows_to_dictionaries_mult(DBT* pk_key, DBT* pk_val, DB_TXN
                 // just as the ydb layer would have in
                 // env->put_multiple(), except that
                 // we will just do a put() right away.
-                error = tokudb_generate_row(db, src_db,
-                        &mult_key_dbt_array[i].dbts[0], &mult_rec_dbt_array[i].dbts[0], 
-                        pk_key, pk_val);
+                error =
+                    tokudb_generate_row(
+                        db,
+                        src_db,
+                        &mult_key_dbt_array[i].dbts[0],
+                        &mult_rec_dbt_array[i].dbts[0],
+                        pk_key,
+                        pk_val);
                 if (error != 0) {
                     goto out;
                 }
-                error = db->put(db, txn, &mult_key_dbt_array[i].dbts[0], 
-                        &mult_rec_dbt_array[i].dbts[0], flags);
+                error =
+                    db->put(
+                        db,
+                        txn,
+                        &mult_key_dbt_array[i].dbts[0],
+                        &mult_rec_dbt_array[i].dbts[0],
+                        flags);
             }
             if (error != 0) {
                 goto out;
@@ -3939,18 +3976,18 @@ int ha_tokudb::insert_rows_to_dictionaries_mult(DBT* pk_key, DBT* pk_val, DB_TXN
         }
     } else {
         // not insert ignore, so we can use put multiple
-        error = db_env->put_multiple(
-            db_env, 
-            share->key_file[primary_key], 
-            txn, 
-            pk_key, 
-            pk_val,
-            curr_num_DBs, 
-            share->key_file, 
-            mult_key_dbt_array,
-            mult_rec_dbt_array,
-            mult_put_flags
-            );
+        error =
+            db_env->put_multiple(
+                db_env,
+                share->key_file[primary_key],
+                txn,
+                pk_key,
+                pk_val,
+                curr_num_DBs,
+                share->key_file,
+                mult_key_dbt_array,
+                mult_rec_dbt_array,
+                mult_put_flags);
     }
 
 out:
@@ -3988,7 +4025,8 @@ int ha_tokudb::write_row(uchar * record) {
 
     //
     // some crap that needs to be done because MySQL does not properly abstract
-    // this work away from us, namely filling in auto increment and setting auto timestamp
+    // this work away from us, namely filling in auto increment and setting
+    // auto timestamp
     //
     ha_statistic_increment(&SSV::ha_write_count);
 #if MYSQL_VERSION_ID < 50600
@@ -4004,9 +4042,9 @@ int ha_tokudb::write_row(uchar * record) {
 
     //
     // check to see if some value for the auto increment column that is bigger
-    // than anything else til now is being used. If so, update the metadata to reflect it
-    // the goal here is we never want to have a dup key error due to a bad increment
-    // of the auto inc field.
+    // than anything else til now is being used. If so, update the metadata to
+    // reflect it the goal here is we never want to have a dup key error due to
+    // a bad increment of the auto inc field.
     //
     if (share->has_auto_inc && record == table->record[0]) {
         share->lock();
@@ -4033,8 +4071,7 @@ int ha_tokudb::write_row(uchar * record) {
     if (!num_DBs_locked_in_bulk) {
         share->_num_DBs_lock.lock_read();
         num_DBs_locked = true;
-    }
-    else {
+    } else {
         lock_count++;
         if (lock_count >= 2000) {
             share->_num_DBs_lock.unlock();
@@ -4055,14 +4092,30 @@ int ha_tokudb::write_row(uchar * record) {
         }
     }
 
-    create_dbt_key_from_table(&prim_key, primary_key, primary_key_buff, record, &has_null);
-    if ((error = pack_row(&row, (const uchar *) record, primary_key))){
+    create_dbt_key_from_table(
+        &prim_key,
+        primary_key,
+        primary_key_buff,
+        record,
+        &has_null);
+    if ((error = pack_row(&row, (const uchar*)record, primary_key))) {
         goto cleanup;
     }
 
-    create_sub_trans = (using_ignore && !(do_ignore_flag_optimization(thd,table,share->replace_into_fast && !using_ignore_no_key)));
+    create_sub_trans =
+        (using_ignore &&
+        !(do_ignore_flag_optimization(
+            thd,
+            table,
+            share->replace_into_fast && !using_ignore_no_key)));
     if (create_sub_trans) {
-        error = txn_begin(db_env, transaction, &sub_trans, DB_INHERIT_ISOLATION, thd);
+        error =
+            txn_begin(
+                db_env,
+                transaction,
+                &sub_trans,
+                DB_INHERIT_ISOLATION,
+                thd);
         if (error) {
             goto cleanup;
         }
@@ -4082,10 +4135,20 @@ int ha_tokudb::write_row(uchar * record) {
         error = do_uniqueness_checks(record, txn, thd);
         if (error) {
             // for #4633
-            // if we have a duplicate key error, let's check the primary key to see
-            // if there is a duplicate there. If so, set last_dup_key to the pk
-            if (error == DB_KEYEXIST && !tokudb_test(hidden_primary_key) && last_dup_key != primary_key) {
-                int r = share->file->getf_set(share->file, txn, DB_SERIALIZABLE, &prim_key, smart_dbt_do_nothing, NULL);
+            // if we have a duplicate key error, let's check the primary key to
+            // see if there is a duplicate there. If so, set last_dup_key to the
+            // pk
+            if (error == DB_KEYEXIST &&
+                !tokudb_test(hidden_primary_key) &&
+                last_dup_key != primary_key) {
+                int r =
+                    share->file->getf_set(
+                        share->file,
+                        txn,
+                        DB_SERIALIZABLE,
+                        &prim_key,
+                        smart_dbt_do_nothing,
+                        NULL);
                 if (r == 0) {
                     // if we get no error, that means the row
                     // was found and this is a duplicate key,
@@ -4130,8 +4193,7 @@ cleanup:
         // we want to return.
         if (error) {
             abort_txn(sub_trans);
-        }
-        else {
+        } else {
             commit_txn(sub_trans, DB_TXN_NOSYNC);
         }
     }
@@ -4163,7 +4225,7 @@ bool ha_tokudb::key_changed(uint keynr, const uchar * old_row, const uchar * new
 int ha_tokudb::update_row(const uchar * old_row, uchar * new_row) {
     TOKUDB_HANDLER_DBUG_ENTER("");
     DBT prim_key, old_prim_key, prim_row, old_prim_row;
-    int error;
+    int error = 0;
     bool has_null;
     THD* thd = ha_thd();
     DB_TXN* sub_trans = NULL;
@@ -4171,7 +4233,6 @@ int ha_tokudb::update_row(const uchar * old_row, uchar * new_row) {
     tokudb_trx_data* trx = (tokudb_trx_data *) thd_get_ha_data(thd, tokudb_hton);
     uint curr_num_DBs;
 
-    LINT_INIT(error);
     memset((void *) &prim_key, 0, sizeof(prim_key));
     memset((void *) &old_prim_key, 0, sizeof(old_prim_key));
     memset((void *) &prim_row, 0, sizeof(prim_row));
@@ -4274,7 +4335,7 @@ int ha_tokudb::update_row(const uchar * old_row, uchar * new_row) {
     error = pack_old_row_for_update(&old_prim_row, old_row, primary_key);
     if (error) { goto cleanup; }
 
-    set_main_dict_put_flags(thd, false, &mult_put_flags[primary_key]);
+    set_main_dict_put_flags(thd, &mult_put_flags[primary_key]);
 
     // for test, make unique checks have a very long duration
     if ((mult_put_flags[primary_key] & DB_OPFLAGS_MASK) == DB_NOOVERWRITE)
@@ -6122,7 +6183,6 @@ int ha_tokudb::info(uint flag) {
         stats.records = share->row_count() + share->rows_from_locked_table;
         stats.deleted = 0;
         if (!(flag & HA_STATUS_NO_LOCK)) {
-
             error = txn_begin(db_env, NULL, &txn, DB_READ_UNCOMMITTED, ha_thd());
             if (error) {
                 goto cleanup;
@@ -6357,7 +6417,7 @@ int ha_tokudb::create_txn(THD* thd, tokudb_trx_data* trx) {
             "created master %p",
             trx->all);
         trx->sp_level = trx->all;
-        trans_register_ha(thd, true, tokudb_hton);
+        trans_register_ha(thd, true, tokudb_hton, NULL);
     }
     DBUG_PRINT("trans", ("starting transaction stmt"));
     if (trx->stmt) { 
@@ -6399,7 +6459,7 @@ int ha_tokudb::create_txn(THD* thd, tokudb_trx_data* trx) {
         trx->sp_level,
         trx->stmt);
     reset_stmt_progress(&trx->stmt_progress);
-    trans_register_ha(thd, false, tokudb_hton);
+    trans_register_ha(thd, false, tokudb_hton, NULL);
 cleanup:
     return error;
 }
@@ -6443,7 +6503,8 @@ int ha_tokudb::external_lock(THD * thd, int lock_type) {
             lock_type_str(lock_type),
             share->full_table_name());
     }
-    TOKUDB_HANDLER_TRACE_FOR_FLAGS(TOKUDB_DEBUG_LOCK, "q %s", thd->query());
+    TOKUDB_HANDLER_TRACE_FOR_FLAGS(TOKUDB_DEBUG_LOCK, "q %s",
+                                   thd->query().str);
 
     int error = 0;
     tokudb_trx_data* trx = (tokudb_trx_data*)thd_get_ha_data(thd, tokudb_hton);
@@ -6523,7 +6584,8 @@ int ha_tokudb::start_stmt(THD* thd, thr_lock_type lock_type) {
         lock_type,
         share->full_table_name());
 
-    TOKUDB_HANDLER_TRACE_FOR_FLAGS(TOKUDB_DEBUG_LOCK, "q %s", thd->query());
+    TOKUDB_HANDLER_TRACE_FOR_FLAGS(TOKUDB_DEBUG_LOCK, "q %s",
+                                   thd->query().str);
 
     int error = 0;
     tokudb_trx_data* trx = (tokudb_trx_data*)thd_get_ha_data(thd, tokudb_hton);
@@ -6564,7 +6626,7 @@ int ha_tokudb::start_stmt(THD* thd, thr_lock_type lock_type) {
         share->rows_from_locked_table = added_rows - deleted_rows;
     }
     transaction = trx->sub_sp_level;
-    trans_register_ha(thd, false, tokudb_hton);
+    trans_register_ha(thd, false, tokudb_hton, NULL);
 cleanup:
     TOKUDB_HANDLER_DBUG_RETURN(error);
 }
@@ -6713,7 +6775,7 @@ static int create_sub_table(
     error = db_create(&file, db_env, 0);
     if (error) {
         DBUG_PRINT("error", ("Got error: %d when creating table", error));
-        my_errno = error;
+        set_my_errno(error);
         goto exit;
     }
 
@@ -7415,8 +7477,8 @@ int ha_tokudb::discard_or_import_tablespace(my_bool discard) {
     }
     return add_table_to_metadata(share->table_name);
     */
-    my_errno=HA_ERR_WRONG_COMMAND;
-    return my_errno;
+    set_my_errno(HA_ERR_WRONG_COMMAND);
+    return my_errno();
 }
 
 
@@ -7574,7 +7636,7 @@ int ha_tokudb::delete_or_rename_table (const char* from_name, const char* to_nam
     error = delete_or_rename_dictionary(from_name, to_name, "status", false, txn, is_delete);
     if (error) { goto cleanup; }
 
-    my_errno = error;
+    set_my_errno(error);
 cleanup:
     if (status_cursor) {
         int r = status_cursor->c_close(status_cursor);
@@ -7962,7 +8024,7 @@ void ha_tokudb::get_auto_increment(
         nr = share->last_auto_increment + increment;
         over = nr < share->last_auto_increment;
         if (over)
-            nr = ULONGLONG_MAX;
+            nr = ULLONG_MAX;
     }
     if (!over) {
         share->last_auto_increment = nr + (nb_desired_values - 1)*increment;
@@ -8179,12 +8241,14 @@ int ha_tokudb::tokudb_add_index(
             goto cleanup;
         }
 
-        error = indexer->set_poll_function(indexer, ai_poll_fun, &lc);
+        error = indexer->set_poll_function(
+            indexer, ha_tokudb::tokudb_add_index_poll, &lc);
         if (error) {
             goto cleanup;
         }
 
-        error = indexer->set_error_callback(indexer, loader_ai_err_fun, &lc);
+        error = indexer->set_error_callback(
+            indexer, ha_tokudb::loader_add_index_err, &lc);
         if (error) {
             goto cleanup;
         }
@@ -8239,12 +8303,14 @@ int ha_tokudb::tokudb_add_index(
             goto cleanup;
         }
 
-        error = loader->set_poll_function(loader, loader_poll_fun, &lc);
+        error =
+            loader->set_poll_function(loader, ha_tokudb::bulk_insert_poll, &lc);
         if (error) {
             goto cleanup;
         }
 
-        error = loader->set_error_callback(loader, loader_ai_err_fun, &lc);
+        error = loader->set_error_callback(
+            loader, ha_tokudb::loader_add_index_err, &lc);
         if (error) {
             goto cleanup;
         }
@@ -8450,6 +8516,24 @@ cleanup:
     }
     thd_proc_info(thd, orig_proc_info);
     TOKUDB_HANDLER_DBUG_RETURN(error ? error : loader_error);
+}
+int ha_tokudb::tokudb_add_index_poll(void* extra, float progress) {
+    LOADER_CONTEXT context = (LOADER_CONTEXT)extra;
+    if (thd_killed(context->thd)) {
+        sprintf(context->write_status_msg,
+                "The process has been killed, aborting add index.");
+        return ER_ABORTING_CONNECTION;
+    }
+    float percentage = progress * 100;
+    sprintf(context->write_status_msg,
+            "Adding of indexes to %s about %.1f%% done",
+            context->ha->share->full_table_name(),
+            percentage);
+    thd_proc_info(context->thd, context->write_status_msg);
+#ifdef HA_TOKUDB_HAS_THD_PROGRESS
+    thd_progress_report(context->thd, (unsigned long long)percentage, 100);
+#endif
+    return 0;
 }
 
 //

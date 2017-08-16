@@ -4,10 +4,11 @@ create table foo (a int, b int, key(b,a), primary key (a))engine=TokuDB;
 create table bar (a bigint)engine=TokuDB;
 alter table foo drop index b;
 alter table bar add index (a);
+# restart
 show create table foo;
 Table	Create Table
 foo	CREATE TABLE `foo` (
-  `a` int(11) NOT NULL DEFAULT '0',
+  `a` int(11) NOT NULL,
   `b` int(11) DEFAULT NULL,
   PRIMARY KEY (`a`)
 ) ENGINE=TokuDB DEFAULT CHARSET=latin1

@@ -57,14 +57,13 @@ DROP TABLE t1;
 SHOW STATUS LIKE 'Slave_open_temp_tables';
 
 --echo ### Continue backup
+--disable_warnings
 SET DEBUG_SYNC = "now SIGNAL ttlss_continue";
-
---echo ## Reset debug_sync points
-SET DEBUG_SYNC = "RESET";
 
 --connection slave_2
 --echo ### Wait for backup finish
 --reap
+--enable_warnings
 
 --let $input_file = $S_SLAVE_INFO_FILE_PATH
 --source include/filter_file.inc

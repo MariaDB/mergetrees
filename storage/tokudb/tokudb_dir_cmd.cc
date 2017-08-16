@@ -42,19 +42,19 @@ static int MDL_and_TDC(THD *thd,
                        const char *table,
                        const dir_cmd_callbacks &cb) {
     int error;
-    LEX_STRING db_arg;
-    LEX_STRING table_arg;
+    LEX_CSTRING db_arg;
+    LEX_CSTRING table_arg;
 
     db_arg.str = const_cast<char *>(db);
     db_arg.length = strlen(db);;
     table_arg.str = const_cast<char *>(table);
     table_arg.length = strlen(table);
-    Table_ident table_ident(thd, db_arg, table_arg, true);;
-    thd->lex->select_lex.add_table_to_list(
+    Table_ident table_ident(thd, db_arg, table_arg, true);
+    thd->lex->select_lex->add_table_to_list(
         thd, &table_ident, NULL, 1, TL_UNLOCK, MDL_EXCLUSIVE, 0, 0, 0);
     /* The lock will be released at the end of mysq_execute_command() */
     error = lock_table_names(thd,
-                             thd->lex->select_lex.table_list.first,
+                             thd->lex->select_lex->table_list.first,
                              NULL,
                              thd->variables.lock_wait_timeout,
                              0);
