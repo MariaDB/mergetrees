@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 1996, 2016, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1996, 2018, Oracle and/or its affiliates. All Rights Reserved.
 Copyright (c) 2012, Facebook Inc.
 
 This program is free software; you can redistribute it and/or modify it under
@@ -492,6 +492,7 @@ dict_table_close(
 					indexes after an aborted online
 					index creation */
 {
+	ibool		drop_aborted;
 	if (!dict_locked && !dict_table_is_intrinsic(table)) {
 		mutex_enter(&dict_sys->mutex);
 	}
@@ -499,6 +500,10 @@ dict_table_close(
 	ut_ad(mutex_own(&dict_sys->mutex) || dict_table_is_intrinsic(table));
 	ut_a(table->get_ref_count() > 0);
 
+	drop_aborted = try_drop
+			&& table->drop_aborted
+			&& table->get_ref_count() == 1
+			&& dict_table_get_first_index(table);
 	table->release();
 
 	/* Intrinsic table is not added to dictionary cache so skip other
@@ -533,12 +538,6 @@ dict_table_close(
 
 	if (!dict_locked) {
 		table_id_t	table_id	= table->id;
-		ibool		drop_aborted;
-
-		drop_aborted = try_drop
-			&& table->drop_aborted
-			&& table->get_ref_count() == 1
-			&& dict_table_get_first_index(table);
 
 		mutex_exit(&dict_sys->mutex);
 
@@ -1560,6 +1559,13 @@ dict_make_room_in_cache(
 
 		if (dict_table_can_be_evicted(table)) {
 
+			DBUG_EXECUTE_IF("crash_if_fts_table_is_evicted",
+			{
+				  if (table->fts &&
+				      dict_table_has_fts_index(table)) {
+					ut_ad(0);
+				  }
+			};);
 			dict_table_remove_from_cache_low(table, TRUE);
 
 			++n_evicted;
@@ -2155,6 +2161,28 @@ dict_table_remove_from_cache_low(
 		foreign->referenced_index = NULL;
 	}
 
+	if (lru_evict && table->drop_aborted) {
+		/* Do as dict_table_try_drop_aborted() does. */
+
+		trx_t* trx = trx_allocate_for_background();
+
+		ut_ad(mutex_own(&dict_sys->mutex));
+		ut_ad(rw_lock_own(dict_operation_lock, RW_LOCK_X));
+
+		/* Mimic row_mysql_lock_data_dictionary(). */
+		trx->dict_operation_lock_mode = RW_X_LATCH;
+
+		trx_set_dict_operation(trx, TRX_DICT_OP_INDEX);
+
+		/* Silence a debug assertion in row_merge_drop_indexes(). */
+		ut_d(table->acquire());
+		row_merge_drop_indexes(trx, table, TRUE);
+		ut_d(table->release());
+		ut_ad(table->get_ref_count() == 0);
+		trx_commit_for_mysql(trx);
+		trx->dict_operation_lock_mode = 0;
+		trx_free_for_background(trx);
+	}
 	/* Remove the indexes from the cache */
 
 	for (index = UT_LIST_GET_LAST(table->indexes);
@@ -2185,29 +2213,6 @@ dict_table_remove_from_cache_low(
 
 	if (lru_evict) {
 		dict_table_autoinc_store(table);
-	}
-
-	if (lru_evict && table->drop_aborted) {
-		/* Do as dict_table_try_drop_aborted() does. */
-
-		trx_t* trx = trx_allocate_for_background();
-
-		ut_ad(mutex_own(&dict_sys->mutex));
-		ut_ad(rw_lock_own(dict_operation_lock, RW_LOCK_X));
-
-		/* Mimic row_mysql_lock_data_dictionary(). */
-		trx->dict_operation_lock_mode = RW_X_LATCH;
-
-		trx_set_dict_operation(trx, TRX_DICT_OP_INDEX);
-
-		/* Silence a debug assertion in row_merge_drop_indexes(). */
-		ut_d(table->acquire());
-		row_merge_drop_indexes(trx, table, TRUE);
-		ut_d(table->release());
-		ut_ad(table->get_ref_count() == 0);
-		trx_commit_for_mysql(trx);
-		trx->dict_operation_lock_mode = 0;
-		trx_free_for_background(trx);
 	}
 
 	/* Free virtual column template if any */
@@ -2548,6 +2553,44 @@ dict_index_add_to_cache(
 {
 	return(dict_index_add_to_cache_w_vcol(
 		table, index, NULL, page_no, strict));
+}
+
+/** Clears the virtual column's index list before index is
+being freed.
+@param[in]  index   Index being freed */
+void
+dict_index_remove_from_v_col_list(dict_index_t* index) {
+	/* Index is not completely formed */
+	if (!index->cached) {
+		return;
+	}
+        if (dict_index_has_virtual(index)) {
+                const dict_col_t*       col;
+                const dict_v_col_t*     vcol;
+
+                for (ulint i = 0; i < dict_index_get_n_fields(index); i++) {
+                        col =  dict_index_get_nth_col(index, i);
+                        if (dict_col_is_virtual(col)) {
+                                vcol = reinterpret_cast<const dict_v_col_t*>(
+                                        col);
+				/* This could be NULL, when we do add
+                                virtual column, add index together. We do not
+                                need to track this virtual column's index */
+				if (vcol->v_indexes == NULL) {
+                                        continue;
+                                }
+				dict_v_idx_list::iterator       it;
+				for (it = vcol->v_indexes->begin();
+                                     it != vcol->v_indexes->end(); ++it) {
+                                        dict_v_idx_t    v_index = *it;
+                                        if (v_index.index == index) {
+                                                vcol->v_indexes->erase(it);
+                                                break;
+                                        }
+				}
+			}
+		}
+	}
 }
 
 /** Adds an index to the dictionary cache, with possible indexing newly
